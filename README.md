@@ -14,12 +14,12 @@
 git clone "https://github.com/sjasonhhh/task-builder.git" task-builder
 cd task-builder
 export TB="$PWD"
-export SCI_ENV=single-cell
+export SCI_ENV=single-cell  # 可改，示例为单细胞组学环境；对应 image/ 和 inputs/ 下的同名目录
 ```
 
 **2 — 准备论文材料**
 
-每篇论文放在一个目录中：
+仓库附带 `paper-001` 合成数据示例，用于展示输入格式；正式运行时替换为真实论文材料。每篇论文放在一个目录中：
 
 ```text
 inputs/single-cell/
@@ -29,15 +29,17 @@ inputs/single-cell/
     │   ├── links.json     # 论文链接及上下文
     │   ├── figures/       # 论文图片
     │   └── tables/        # 论文表格
+    │       └── summary.csv
     ├── data/             # 实验数据
+    │   └── counts.csv
     └── code/             # 论文代码
+        └── analyze.py
 ```
 
 在 `config/run.txt` 中填写要生成任务的论文目录名，每行一个：
 
 ```text
 paper-001
-paper-002
 ```
 
 **3 — 配置模型与集群**

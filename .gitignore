@@ -29,6 +29,11 @@
 !/scripts/
 /scripts/*
 !/scripts/start_worker.sh
+!/inputs/
+/inputs/*
+!/inputs/single-cell/
+/inputs/single-cell/*
+!/inputs/single-cell/paper-001/
 __pycache__/
 *.pyc
 .pytest_cache/
