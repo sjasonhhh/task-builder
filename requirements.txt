@@ -1,0 +1,4 @@
+harbor==0.22.0
+pytest==8.4.1
+tomli==2.2.1
+pypdf==6.19.0

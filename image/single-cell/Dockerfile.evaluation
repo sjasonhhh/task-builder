@@ -1,0 +1,13 @@
+# 单细胞评测镜像：沿用已推送的 biology 评测镜像，只追加读取 .h5ad 所需的包。
+# 原镜像（python3.11 + torch cu121 + numpy/pandas/scipy/scikit-learn/pytest 等）不升级任何已装包。
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+COPY requirements-evaluation.txt /tmp/requirements-evaluation.txt
+RUN python -m pip freeze > /tmp/base-constraints.txt \
+    && python -m pip install --no-cache-dir --only-binary=:all: \
+        -c /tmp/base-constraints.txt \
+        -r /tmp/requirements-evaluation.txt \
+    && rm -f /tmp/requirements-evaluation.txt /tmp/base-constraints.txt
+
+WORKDIR /tests

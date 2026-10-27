@@ -1,0 +1,191 @@
+--- a/harbor/job.py
++++ b/harbor/job.py
+@@ -1,8 +1,9 @@
+ import asyncio
+ import logging
+ import shutil
++import traceback
+ from collections import defaultdict
+-from datetime import datetime
++from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Any
+ from uuid import UUID, uuid4
+@@ -45,7 +46,12 @@
+     TrialConfig,
+ )
+ from harbor.models.trial.paths import TrialPaths
+-from harbor.models.trial.result import TrialResult
++from harbor.models.trial.result import (
++    AgentInfo,
++    ExceptionInfo,
++    ModelInfo,
++    TrialResult,
++)
+ from harbor.tasks.client import TaskClient, TaskDownloadResult, TaskIdType
+ from harbor.telemetry import capture_job_finished_async, record_command_job_id
+ from harbor.trial.hooks import HookCallback, TrialEvent, TrialHookEvent
+@@ -1197,11 +1203,160 @@
+             self.add_hook(TrialEvent.END, on_end_quiet)
+ 
+         coros = self._trial_queue.submit_batch(self._remaining_trial_configs)
++        outcomes = await asyncio.gather(*coros, return_exceptions=True)
++
++        trial_results: list[TrialResult] = []
++        for trial_config, outcome in zip(
++            self._remaining_trial_configs, outcomes, strict=True
++        ):
++            if isinstance(outcome, TrialResult):
++                trial_results.append(outcome)
++                continue
++
++            if isinstance(outcome, (KeyboardInterrupt, SystemExit, GeneratorExit)):
++                raise outcome
++
++            if isinstance(outcome, BaseException):
++                result = self._recover_unhandled_trial_result(trial_config, outcome)
++                trial_results.append(result)
++                self._finish_isolated_trial_progress(
++                    trial_config, result, loading_progress, loading_progress_task,
++                    running_progress, trial_progress_tasks, advanced_trials,
++                )
++                continue
++
++            unexpected = RuntimeError(
++                "Trial returned an unexpected result type: "
++                f"{type(outcome).__name__}"
++            )
++            result = self._recover_unhandled_trial_result(trial_config, unexpected)
++            trial_results.append(result)
++            self._finish_isolated_trial_progress(
++                trial_config, result, loading_progress, loading_progress_task,
++                running_progress, trial_progress_tasks, advanced_trials,
++            )
++
++        return trial_results
++
++    def _finish_isolated_trial_progress(
++        self,
++        trial_config: TrialConfig,
++        result: TrialResult,
++        loading_progress: Progress,
++        loading_progress_task,
++        running_progress: Progress | None,
++        trial_progress_tasks: dict[str, TaskID],
++        advanced_trials: set[str],
++    ) -> None:
++        """Clear live state for a trial that failed outside normal hooks."""
++        trial_name = trial_config.trial_name
++        self._running_trial_names.discard(trial_name)
++        if self._is_cancelled_result(result):
++            self._cancelled_trial_names.add(trial_name)
++        else:
++            self._cancelled_trial_names.discard(trial_name)
+ 
+-        async with asyncio.TaskGroup() as tg:
+-            tasks = [tg.create_task(coro) for coro in coros]
++        if running_progress is not None and trial_name in trial_progress_tasks:
++            running_progress.remove_task(trial_progress_tasks.pop(trial_name))
+ 
+-        return [t.result() for t in tasks]
++        if trial_name not in advanced_trials:
++            advanced_trials.add(trial_name)
++            loading_progress.advance(loading_progress_task)
++
++    def _recover_unhandled_trial_result(
++        self,
++        trial_config: TrialConfig,
++        exception: BaseException,
++    ) -> TrialResult:
++        """Keep one unhandled trial failure from aborting the whole job.
++
++        Most failures are already converted to a TrialResult by Trial.run().
++        This fallback covers failures before a Trial exists and failures raised
++        by cleanup or hooks after Trial.run() has started.  A result written by
++        the trial is preferred so that its verifier output and logs are kept.
++        """
++        result_path = TrialPaths(
++            trial_config.trials_dir / trial_config.trial_name
++        ).result_path
++        if result_path.exists():
++            try:
++                result = TrialResult.model_validate_json(result_path.read_text())
++                self._logger.warning(
++                    "Isolated trial failure for %s after result was written: %s",
++                    trial_config.trial_name,
++                    type(exception).__name__,
++                )
++                return result
++            except Exception as read_error:
++                self._logger.warning(
++                    "Could not read partial result for isolated trial %s: %s",
++                    trial_config.trial_name,
++                    read_error,
++                )
++
++        now = datetime.now(timezone.utc)
++        try:
++            task_id = trial_config.task.get_task_id()
++            task_name = task_id.get_name()
++        except Exception:
++            task_id = trial_config.task.get_task_id()
++            task_name = str(task_id)
++
++        agent_name = (
++            trial_config.agent.name
++            or trial_config.agent.import_path
++            or "unknown-agent"
++        )
++        model_info = (
++            ModelInfo(name=trial_config.agent.model_name)
++            if trial_config.agent.model_name
++            else None
++        )
++        exception_info = ExceptionInfo(
++            exception_type=type(exception).__name__,
++            exception_message=str(exception),
++            exception_traceback="".join(
++                traceback.format_exception(
++                    type(exception), exception, exception.__traceback__
++                )
++            ),
++            occurred_at=now,
++        )
++        result = TrialResult(
++            task_name=task_name,
++            trial_name=trial_config.trial_name,
++            trial_uri=(
++                trial_config.trials_dir / trial_config.trial_name
++            ).expanduser().resolve().as_uri(),
++            task_id=task_id,
++            source=trial_config.task.source,
++            task_checksum="unavailable",
++            config=trial_config,
++            agent_info=AgentInfo(
++                name=agent_name,
++                version="unknown",
++                model_info=model_info,
++            ),
++            exception_info=exception_info,
++            started_at=now,
++            finished_at=now,
++        )
++        result_path.parent.mkdir(parents=True, exist_ok=True)
++        result_path.write_text(result.model_dump_json(indent=4))
++
++        level = (
++            logging.WARNING
++            if isinstance(exception, asyncio.CancelledError)
++            else logging.ERROR
++        )
++        self._logger.log(
++            level,
++            "Isolated trial %s (%s): %s",
++            trial_config.trial_name,
++            type(exception).__name__,
++            str(exception) or "no message",
++        )
++        return result
+ 
+     def _update_metric_display(
+         self, event: TrialHookEvent, loading_progress, loading_progress_task

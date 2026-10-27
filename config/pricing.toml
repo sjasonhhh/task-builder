@@ -1,0 +1,8 @@
+# 估算成本用的单价：美元 / 百万 token。
+# [default] 适用于未单独列出的模型；需要区分模型时，按模型名（env 中的 MODEL_ID）新增同名表覆盖。
+# cache_read 为缓存命中的输入；cache_creation 未单列时按 input 计。
+
+[default]
+input = 1.0
+output = 4.0
+cache_read = 0.1

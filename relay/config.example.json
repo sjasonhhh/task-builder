@@ -1,0 +1,14 @@
+{
+  "bind_host": "0.0.0.0",
+  "advertised_host": "<worker可以访问的开发机IP>",
+  "entries": [
+    {
+      "name": "author",
+      "env_file": "../config/author.env",
+      "base_url_var": "ANTHROPIC_BASE_URL",
+      "auth_var": "ANTHROPIC_AUTH_TOKEN",
+      "auth_type": "bearer",
+      "model_var": "MODEL_ID"
+    }
+  ]
+}

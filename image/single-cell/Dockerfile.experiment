@@ -1,0 +1,34 @@
+# 单细胞与空间组学实验镜像：在已推送的 biology author 镜像上叠加单细胞栈。
+# 底座已有 python3.11 + torch 2.4.1(cu121) + scanpy/anndata/umap、R 4.2.2 + edgeR/limma、samtools/bedtools，
+# 以及 claude/harbor/uv 编排栈。这里只追加，不升级底座任何已装包（构建时用底座 pip freeze 作约束）。
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# R 单细胞包：全部用 Debian bookworm 预编译包（与底座 R 4.2.2 同源），不做源码编译。
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get install -y --no-install-recommends \
+        r-cran-biocmanager \
+        r-cran-sctransform \
+        r-cran-seurat \
+        r-cran-seuratobject \
+        r-bioc-complexheatmap \
+        r-bioc-dropletutils \
+        r-bioc-scater \
+        r-bioc-scran \
+        r-bioc-scuttle \
+        r-bioc-singlecellexperiment \
+        r-bioc-singler \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /root/.cache
+
+# Python 单细胞栈（scvi-tools、squidpy、scvelo、scib、harmonypy、scanorama、torch-geometric、muon、
+# pydeseq2、gseapy、celltypist、decoupler 等）。requirements 为完整锁定的增量依赖；
+# 仅 annoy、fbpca、loompy、docrep 等少数包没有 wheel，从源码构建。
+COPY requirements-experiment.txt /tmp/requirements-experiment.txt
+RUN python -m pip freeze > /tmp/base-constraints.txt \
+    && python -m pip install --no-cache-dir --prefer-binary \
+        -c /tmp/base-constraints.txt \
+        -r /tmp/requirements-experiment.txt \
+    && rm -f /tmp/requirements-experiment.txt /tmp/base-constraints.txt
+
+WORKDIR /workspace
