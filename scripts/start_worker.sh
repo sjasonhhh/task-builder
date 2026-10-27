@@ -10,6 +10,7 @@ import sys
 
 from task_builder.config import load_image_env
 from task_builder.models import ConfigError
+from task_builder.paths import PROJECT_ROOT
 from task_builder.worker import build_parser
 
 
@@ -26,10 +27,15 @@ def main():
         if not separator or not source.startswith("gpfs://") or not target.startswith("/"):
             raise ConfigError("mount 应为 gpfs://gpfs1/<存储名称>:<worker 上的绝对路径>")
 
-        # rlaunch 默认沿用本机当前目录；显式使用 /，避免要求 worker 存在本机项目路径。
+        # 按脚本所在项目的实际位置挂载，不依赖调用目录或用户手工设置的 TB。
+        project = str(PROJECT_ROOT)
+        if any(char in project for char in ":\r\n"):
+            raise ConfigError("项目路径不能包含冒号或换行符，无法用于 --volume")
+        # rlaunch 默认沿用本机当前目录；显式使用 /，项目由 volume 单独挂载。
         command = [
             "rlaunch", f"--namespace={config.namespace}", f"--charged-group={config.charged_group}",
             "--private-machine=group", f"--image={args.image}", f"--mount={config.mount}",
+            f"--volume={project}:{project}",
             f"--cpu={args.cpu}", f"--memory={args.memory_mb}", f"--requests.memory={args.memory_mb}",
             f"--gpu={args.gpus}", "--workdir=/", "--enable-sshd=true", "--max-wait-duration=15m",
             "--i-know-i-am-wasting-resource=true", "--comment=task-builder", "--detach",
@@ -47,6 +53,7 @@ def main():
         print("进入 worker：\n" + shlex.join([
             "brainctl", "exec", f"--namespace={config.namespace}", "-it", f"process/{name}", "--", "bash",
         ]))
+        print("进入后执行：\nexport TB=" + shlex.quote(project) + '\ncd "$TB"')
         return 0
     except subprocess.TimeoutExpired:
         print("启动等待超时，请在集群中检查本次 task-builder worker 是否已启动。", file=sys.stderr)
