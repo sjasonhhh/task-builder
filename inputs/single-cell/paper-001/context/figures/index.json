@@ -1,0 +1,32 @@
+[
+  {
+    "id": "Fig1",
+    "label": "Fig. 1",
+    "caption": "A schematic of the mechanism for barcode swapping, as proposed by Sinha et al.1. On new models of the Illumina sequencing machines, flow cell seeding and DNA amplification take place simultaneously, without any washes of the flow cell between steps. As a result, free sample indexing barcodes remain in solution and can be inadvertently extended using DNA molecules from libraries with different barcodes as templates. The transfer of mislabelled molecules between nanowells of the flow cell results in clustering and sequencing of incorrectly labelled DNA molecules",
+    "source": "nature.com (Springer Nature image CDN)",
+    "files": [
+      "figures/41467_2018_5083_Fig1_HTML.jpg"
+    ],
+    "status": "image_available"
+  },
+  {
+    "id": "Fig2",
+    "label": "Fig. 2",
+    "caption": "Characterization of barcode swapping in plate-based scRNA-seq experiments. a The experimental design of the Richard dataset. Two 96-well plates of cells were multiplexed for sequencing. Expected barcode combinations are marked in blue, while impossible barcode combinations are marked in grey. b Distribution of the library sizes (i.e., number of mapped reads) in the expected and impossible barcode combinations. c Library size of each impossible combination (observed swapped reads), plotted against the sum of the library sizes of the expected combinations that share exactly one barcode with that impossible combination (available swapping reads). An example is illustrated graphically in the inset Figure for one impossible combination (red) and the contributing expected combinations (orange). The gradient represents the fraction of available reads from the expected combinations that swap into each impossible combination. d Estimated swapping fractions for different plates of the Nestorowa et al. [10] dataset, plotted against the ratio of the concentration of free barcode to the concentration of cDNA of the correct length for sequencing. A linear regression fit is shown with its 95% confidence interval. The slope of the fitted line is not significantly different from 0 (p = 0.129)",
+    "source": "nature.com (Springer Nature image CDN)",
+    "files": [
+      "figures/41467_2018_5083_Fig2_HTML.jpg"
+    ],
+    "status": "image_available"
+  },
+  {
+    "id": "Fig3",
+    "label": "Fig. 3",
+    "caption": "Characterization of barcode swapping in droplet-based scRNA-seq experiments. a The expected number of cells with shared cell barcodes in 10x Genomics samples that have been multiplexed for sequencing, for different numbers of samples and different numbers of captured cells per sample. The cell exclusion approach for barcode swapping would remove these cells. b A schematic of our method to remove swapped reads from droplet data. Reads found in different samples with the same combination of UMI, cell barcode, and aligned gene were considered to have swapped. If most reads (≥80%) were present in one sample, we excluded the molecule from all other samples (i). If reads were more evenly spread across samples, we excluded the molecule from all samples (ii). Reads in one sample only were retained (iii). c t-SNE plot of the expression profiles of mouse epithelial cells17. Each point represents a cell that is coloured by sample. Letters correspond to different experimental conditions while numbers represent biological replicates. d The distribution of the library sizes for called cells in each sample. Cells were called using emptyDrops, with an FDR threshold of 1% and a minimum of 1000 UMIs. e The number of called cells for each sample, before and after application of our swapped read exclusion algorithm",
+    "source": "nature.com (Springer Nature image CDN)",
+    "files": [
+      "figures/41467_2018_5083_Fig3_HTML.jpg"
+    ],
+    "status": "image_available"
+  }
+]

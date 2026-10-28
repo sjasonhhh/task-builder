@@ -1,6 +1,7 @@
 # Only source code, reproducible environment definitions and examples are published.
 /*
 !/.gitignore
+!/.gitattributes
 !/README.md
 !/requirements.txt
 !/setup_env.sh

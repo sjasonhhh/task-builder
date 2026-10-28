@@ -1,4 +1,236 @@
-{
-  "description": "合成输入格式示例，不对应真实论文；真实材料的链接填写在 links 中。",
-  "links": []
-}
+[
+  {
+    "url": "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE81682",
+    "section_id": "methods-nestorowa-dataset-analysis",
+    "section_title": "Nestorowa dataset analysis",
+    "page": null,
+    "context": "We obtained count matrices from the authors of the Nestorowa et al. study10 (also available at NCBI GEO accession GSE81682). For each plate, we fitted a linear model to quantify contributions of different cells in the HiSeq 2500 data to the swapping-affected transcriptomes of the HiSeq 4000 data (see Supplementary Note 4). The fitted model was used to estimate the swapping fraction for that plate. The mean and standard deviation of swapping fractions were then computed across plates.",
+    "source": "article.xml",
+    "kind": "ext-link"
+  },
+  {
+    "url": "https://github.com/MarioniLab/BarcodeSwapping2017",
+    "section_id": "code-availability",
+    "section_title": "Code availability",
+    "page": null,
+    "context": "A Github repository (https://github.com/MarioniLab/BarcodeSwapping2017) contains a detailed report that expands on the analyses described herein, describing models and showing results. The repository also contains a script to download the processed data, and the code used to generate the report.",
+    "source": "article.xml",
+    "kind": "ext-link"
+  },
+  {
+    "url": "https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-6843/",
+    "section_id": "data-availability",
+    "section_title": "Data availability",
+    "page": null,
+    "context": "Raw data can be acquired from ArrayExpress accession codes E-MTAB-6843 for plate-prepared mouse T-cells, and E-MTAB-6854 for droplet-prepared HiSeq 2500- and HiSeq 4000-sequenced mouse epithelial cells.",
+    "source": "article.xml",
+    "kind": "ext-link"
+  },
+  {
+    "url": "https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-6854/",
+    "section_id": "data-availability",
+    "section_title": "Data availability",
+    "page": null,
+    "context": "Raw data can be acquired from ArrayExpress accession codes E-MTAB-6843 for plate-prepared mouse T-cells, and E-MTAB-6854 for droplet-prepared HiSeq 2500- and HiSeq 4000-sequenced mouse epithelial cells.",
+    "source": "article.xml",
+    "kind": "ext-link"
+  },
+  {
+    "url": "http://biorxiv.org/content/early/2017/04/09/125724",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "1.Sinha, R. et al. Index switching causes “spreading-of-signal” among multiplexed samples in illumina HiSeq 4000 DNA sequencing. Preprint at bioRxiv: http://biorxiv.org/content/early/2017/04/09/125724 (2017).",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1186/s12864-018-4703-0",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "2.Costello M, et al. Characterization and remediation of sample index swaps by non-redundant dual indexing on massively parallel sequencing platforms. BMC Genom. 2018;19:332. doi: 10.1186/s12864-018-4703-0.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1038/ncomms14049",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "3.Zheng GX, et al. Massively parallel digital transcriptional profiling of single cells. Nat. Commun. 2017;8:14049. doi: 10.1038/ncomms14049.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://www.biorxiv.org/content/early/2017/09/27/191056",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "4.Schiebinger, G. et al. Reconstruction of developmental landscapes by optimal-transport analysis of single-cell gene expression sheds light on cellular reprogramming. Preprint at bioRxiv: https://www.biorxiv.org/content/early/2017/09/27/191056 (2017).",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1016/j.cell.2016.11.038",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "5.Dixit A, et al. Perturb-Seq: dissecting molecular circuits with scalable single-cell RNA profiling of pooled genetic screens. Cell. 2016;167:1853–1866.e17. doi: 10.1016/j.cell.2016.11.038.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1038/nprot.2014.006",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "6.Picelli, S. et al. Full-length RNA-seq from single cells using Smart-seq2. Nat. Protoc.9, 171–181 (2014).",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1126/science.1247651",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "7.Jaitin DA, et al. Massively parallel single-cell RNA-seq for marker-free decomposition of tissues into cell types. Science. 2014;343:776–779. doi: 10.1126/science.1247651.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1186/s13059-016-0938-8",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "8.Hashimshony T, et al. Cel-seq2: sensitive highly-multiplexed single-cell rna-seq. Genome Biol. 2016;17:77. doi: 10.1186/s13059-016-0938-8.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1038/s41590-018-0160-9",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "9.Richard, A. C. et al. T cell cytolytic capacity is independent of initial stimulation strength. Nat. Immunol. (in press, 2018).",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1182/blood-2016-05-716480",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "10.Nestorowa S, et al. A single cell resolution map of mouse haematopoietic stem and progenitor cell differentiation. Blood. 2016;128:e20–e31. doi: 10.1182/blood-2016-05-716480.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1038/nmeth.4666",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "11.Larsson AJM, Stanley G, Sinha R, Weissman IL, Sandberg R. Computational correction of index switching in multiplexed sequencing libraries. Nat. Methods. 2018;15:305–307. doi: 10.1038/nmeth.4666.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1016/j.cell.2015.05.002",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "12.Macosko EZ, et al. Highly parallel genome-wide expression profiling of individual cells using nanoliter droplets. Cell. 2015;161:1202–1214. doi: 10.1016/j.cell.2015.05.002.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://www.biorxiv.org/content/early/2017/12/21/237693",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "13.Stoeckius. M. et al. Cell “hashing” with barcoded antibodies enables multiplexing and doublet detection for single cell genomics. Preprint at bioRxiv: https://www.biorxiv.org/content/early/2017/12/21/237693 (2017).",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1186/s13059-018-1603-1",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "13.Stoeckius. M. et al. Cell “hashing” with barcoded antibodies enables multiplexing and doublet detection for single cell genomics. Preprint at bioRxiv: https://www.biorxiv.org/content/early/2017/12/21/237693 (2017).",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1038/s41467-017-02001-5",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "14.Bach K, et al. Differentiation dynamics of mammary epithelial cells revealed by single-cell RNA sequencing. Nat. Commun. 2017;8:2128. doi: 10.1038/s41467-017-02001-5.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1016/j.stem.2015.04.004",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "15.Wilson NK, et al. Combined single-cell functional and gene expression analysis resolves heterogeneity within stem cell populations. Cell Stem Cell. 2015;16:712–724. doi: 10.1016/j.stem.2015.04.004.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.12688/f1000research.9501.1",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "16.Lun ATL, McCarthy DJ, Marioni JC. A step-by-step workflow for low-level analysis of single-cell RNA-seq data with bioconductor. F1000Res. 2016;5:2122. doi: 10.12688/f1000research.9501.1.",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://www.biorxiv.org/content/early/2018/04/04/234872",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "18.Lun, A. T. L. et al. Distinguishing cells from empty droplets in droplet-based single-cell RNA sequencing data. Preprint at bioRxiv: https://www.biorxiv.org/content/early/2018/04/04/234872 (2018).",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://doi.org/10.1186/s13059-019-1662-y",
+    "section_id": "references",
+    "section_title": "References",
+    "page": null,
+    "context": "18.Lun, A. T. L. et al. Distinguishing cells from empty droplets in droplet-based single-cell RNA sequencing data. Preprint at bioRxiv: https://www.biorxiv.org/content/early/2018/04/04/234872 (2018).",
+    "source": "article.xml",
+    "kind": "reference"
+  },
+  {
+    "url": "https://static-content.springer.com/esm/art%3A10.1038%2Fs41467-018-05083-x/MediaObjects/41467_2018_5083_MOESM1_ESM.pdf",
+    "section_id": "supplementary-material",
+    "section_title": "Electronic supplementary material",
+    "page": null,
+    "context": "Supplementary Information (41467_2018_5083_MOESM1_ESM.pdf, PDF, 4.7 MB; local copy: context/supplementary/41467_2018_5083_MOESM1_ESM.pdf) containing Supplementary Notes 1-7 and Supplementary Figures 1-33.",
+    "source": "nature.com",
+    "kind": "supplementary-material"
+  },
+  {
+    "url": "http://creativecommons.org/licenses/by/4.0/",
+    "section_id": "open-access",
+    "section_title": "Open Access",
+    "page": null,
+    "context": "To view a copy of this license, visit http://creativecommons.org/licenses/by/4.0/.",
+    "source": "text.md",
+    "kind": "visible URL"
+  },
+  {
+    "url": "http://npg.nature.com/reprintsandpermissions/",
+    "section_id": "additional-information",
+    "section_title": "Additional information",
+    "page": null,
+    "context": "Reprints and permission information is available online at http://npg.nature.com/reprintsandpermissions/",
+    "source": "text.md",
+    "kind": "visible URL"
+  }
+]
