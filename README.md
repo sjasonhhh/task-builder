@@ -17,7 +17,7 @@ export TB="$PWD"
 export SCI_ENV=single-cell  # 可改，示例为单细胞组学环境；对应 image/ 和 inputs/ 下的同名目录
 ```
 
-**2 — 准备论文材料**
+**2 — 准备论文材料与环境文件**
 
 仓库附带 `paper-001` 合成数据示例，用于展示输入格式；正式运行时替换为真实论文材料。每篇论文放在一个目录中：
 
@@ -42,6 +42,18 @@ inputs/single-cell/
 paper-001
 ```
 
+环境文件放在 `image/<SCI_ENV>/`；仓库已附带 `single-cell` 示例，使用其他环境时按实际镜像准备同样的文件：
+
+```text
+image/single-cell/
+├── Dockerfile.experiment       # 实验镜像定义
+├── Dockerfile.evaluation       # 评分镜像定义
+├── requirements-experiment.txt # 实验环境依赖
+├── requirements-evaluation.txt # 评分环境依赖
+├── README.md                   # 镜像中的软件与环境说明
+└── image-env.toml              # 下一步填写镜像与集群参数
+```
+
 **3 — 配置模型与集群**
 
 模型配置填写在 `config/author.env`：
@@ -62,7 +74,7 @@ evaluation = "<评分镜像地址>"
 [hcluster]
 namespace = "<集群命名空间>"
 charged_group = "<计费资源组>"
-mount = "gpfs://gpfs1/<共享存储名称>:<开发机上的共享存储绝对路径>"
+mount = "gpfs://gpfs1/<共享存储名称>:<worker上的共享存储绝对路径>"
 max_cpu = 16
 max_memory_mb = 65536
 max_agent_gpus = 1
@@ -74,14 +86,14 @@ agent_timeout_sec = 36000
 harbor_timeout_sec = 36000
 ```
 
-`mount` 使用与开发机相同的共享存储路径，使 worker（运行任务的机器）能够从相同路径读取项目。
+`mount` 指定 worker 中的数据存储位置；启动脚本会另外将项目自动挂载到与开发机相同的路径。
 
 模型请求通过开发机转发，配置填写在 `relay/config.json`：
 
 ```json
 {
   "bind_host": "0.0.0.0",
-  "advertised_host": "<worker可以访问的开发机IP>",
+  "advertised_host": null,
   "entries": [
     {
       "name": "author",
@@ -95,11 +107,16 @@ harbor_timeout_sec = 36000
 }
 ```
 
+`advertised_host`：默认 `null`，自动识别开发机 IP；知道 worker 可访问的开发机 IP 时可自行填写，不是 worker ID。
+
+`env_file`：填写自己的模型配置文件路径；示例 `../config/author.env` 相对于 `relay/`，也可以填写绝对路径。
+
 **4 — 启动 worker**
 
 在开发机执行。worker 镜像需包含科研软件、Claude Code 和 rjob；可直接使用预装 Harbor 0.22.0 及项目补丁的镜像。
 
 ```bash
+proxy_on  # 模型接口需要网络代理时执行，须在启动反代之前
 python3 "$TB/relay/relay.py" start
 
 bash "$TB/scripts/start_worker.sh" \
@@ -128,6 +145,14 @@ export PATH="/kubebrain:$PATH"
 cd "$TB"
 
 bash setup_env.sh
+```
+
+验证反代，返回 `OK` 后生成任务：
+
+```bash
+python3 "$TB/relay/relay.py" exec \
+  --entry author -- \
+  claude -p "只回复 OK"
 
 bash run.sh \
   --sci-env "$SCI_ENV" \

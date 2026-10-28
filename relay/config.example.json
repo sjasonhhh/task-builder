@@ -1,6 +1,6 @@
 {
   "bind_host": "0.0.0.0",
-  "advertised_host": "<worker可以访问的开发机IP>",
+  "advertised_host": null,
   "entries": [
     {
       "name": "author",
