@@ -25,7 +25,7 @@
 !/image/*/Dockerfile.*
 !/image/*/requirements-*.txt
 !/image/*/README.md
-!/image/*/image-env.toml.example
+!/image/single-cell/image-env.toml
 !/scripts/
 /scripts/*
 !/scripts/start_worker.sh
