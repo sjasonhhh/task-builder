@@ -1,17 +1,17 @@
 [images]
-experiment = "<实验镜像地址>"
-evaluation = "<评分镜像地址>"
+experiment = "registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting:scienv-single-cell-experiment-gpu-20261022" # 实验镜像地址
+evaluation = "registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting:scienv-single-cell-evaluation-gpu-20261022" # 评分镜像地址
 
 [hcluster]
-namespace = "<集群命名空间>"
-charged_group = "<计费资源组>"
-mount = "gpfs://gpfs1/<共享存储名称>:<开发机上的共享存储绝对路径>"
-max_cpu = 16
-max_memory_mb = 65536
-max_agent_gpus = 1
-max_verifier_gpus = 1
-priority = 9
+namespace = "ailab-datatools" # 填自己的集群命名空间
+charged_group = "data_tools_gpu_pool" # 填自己的计费资源组
+mount = "gpfs://gpfs1/cl4mind:/mnt/shared-storage-user/cl4mind" # 填自己的共享存储地址:worker 内挂载路径
+max_cpu = 16 # 单个任务的 CPU 核数上限
+max_memory_mb = 65536 # 内存上限，单位 MB
+max_agent_gpus = 1 # 答题任务的 GPU 数量上限
+max_verifier_gpus = 1 # 评分任务的 GPU 数量上限
+priority = 9 # 集群任务优先级
 
 [timeouts]
-agent_timeout_sec = 36000
-harbor_timeout_sec = 36000
+agent_timeout_sec = 36000 # 答题超时，单位秒
+harbor_timeout_sec = 36000 # Harbor 运行超时，单位秒
