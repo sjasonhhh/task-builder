@@ -6,6 +6,7 @@
 !/requirements.txt
 !/setup_env.sh
 !/run.sh
+!/run_sandbox.sh
 !/run_task.sh
 !/task_builder/
 !/patches/
@@ -26,6 +27,7 @@
 !/image/*/Dockerfile.*
 !/image/*/requirements-*.txt
 !/image/*/README.md
+!/image/*/human_advise.md
 !/image/single-cell/image-env.toml
 !/scripts/
 /scripts/*
@@ -35,6 +37,12 @@
 !/inputs/single-cell/
 /inputs/single-cell/*
 !/inputs/single-cell/paper-001/
+!/tests/
+/tests/*
+!/tests/test_human_review.py
+!/tests/test_sandbox_runtime.py
+!/tests/test_sandbox_dispatch.py
+!/tests/test_agent_reads.py
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -43,3 +51,9 @@ __pycache__/
 *.env
 *.pem
 *.key
+
+!/image/chemistry/
+!/image/chemistry/Dockerfile.*
+!/image/chemistry/requirements-*.txt
+!/image/chemistry/image-env.toml.example
+!/image/chemistry/README.md

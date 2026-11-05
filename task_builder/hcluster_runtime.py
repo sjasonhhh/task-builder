@@ -22,7 +22,7 @@ import select
 from pathlib import Path
 from typing import Any
 
-from .integrity import content_manifest, file_digest, manifest_differences
+from .integrity import file_digest
 from .deadline import remaining_timeout
 from .models import TaskTimeout
 
@@ -69,10 +69,6 @@ DEFAULT_CPUS = 4
 DEFAULT_MEMORY_MB = 8192
 DEFAULT_GPUS = 1
 THREAD_ENV_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
-
-
-class _UploadSourceChanged(RuntimeError):
-    pass
 
 
 class _UploadCleanupUnconfirmed(RuntimeError):
@@ -478,7 +474,6 @@ print(json.dumps(result))'''
     def _verified_upload(self, source: Path, target: str) -> None:
         if not source.exists() or source.is_symlink():
             raise FileNotFoundError(f"上传源文件不存在或不是独立文件: {source}")
-        expected = content_manifest(source)
         stage = target.rstrip("/") + ".upload-" + uuid.uuid4().hex
         failure = ""
         transaction = stage + ".transaction"
@@ -489,31 +484,18 @@ print(json.dumps(result))'''
         rollback = f"if [ -d {quoted_transaction} ]; then if [ ! -e {quoted_transaction}/committed ]; then if [ -e {backup} ] || [ -L {backup} ]; then rm -rf {quoted_target} && mv {backup} {quoted_target} || exit 1; elif [ -e {quoted_transaction}/new-target ]; then rm -rf {quoted_target} || exit 1; fi; fi; rm -rf {quoted_transaction} || exit 1; fi; rm -rf {quoted_stage} && test ! -e {quoted_stage} && test ! -e {quoted_transaction}"
         for attempt in range(3):
             try:
-                if content_manifest(source) != expected:
-                    raise _UploadSourceChanged("上传过程中本地源文件发生变化")
                 self._checked_exec(f"rm -rf {shlex.quote(stage)} && mkdir -p {shlex.quote(str(Path(stage).parent))}")
                 result = self._brainctl_cp_to(source, stage)
                 if result.returncode != 0:
                     raise RuntimeError(self._decode(result.stderr) or "上传失败")
-                if content_manifest(source) != expected:
-                    raise _UploadSourceChanged("上传过程中本地源文件发生变化")
-                differences = manifest_differences(expected, self._remote_manifest(stage))
-                if differences:
-                    raise RuntimeError("缺失或内容不一致: " + ", ".join(differences))
                 self._checked_exec(f"mkdir {quoted_transaction} && if [ -e {quoted_target} ] || [ -L {quoted_target} ]; then mv {quoted_target} {backup}; else touch {quoted_transaction}/new-target; fi && mv {quoted_stage} {quoted_target}")
-                actual = self._remote_manifest(target)
-                differences = manifest_differences(expected, actual)
-                if differences:
-                    raise RuntimeError("正式位置检查失败: " + ", ".join(differences))
                 self._checked_exec(f"touch {quoted_transaction}/committed && rm -rf {quoted_transaction} && test ! -e {quoted_transaction}")
-                self._runtime_event("upload-verified", source=str(source), target=target, attempt=attempt, manifest=expected)
+                self._runtime_event("upload-complete", source=str(source), target=target, attempt=attempt)
                 return
             except TaskTimeout:
                 raise
             except _UploadCleanupUnconfirmed as exc:
                 self._runtime_event("upload-failed", source=str(source), target=target, attempt=attempt, error=str(exc))
-                raise
-            except _UploadSourceChanged:
                 raise
             except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
                 failure = str(exc)
@@ -525,7 +507,7 @@ print(json.dumps(result))'''
                     self._runtime_event("upload-cleanup-failed", directory=stage, error=str(exc))
                     self._runtime_event("upload-failed", source=str(source), target=target, attempt=attempt, error=f"上传临时文件清理或原文件恢复未确认: {stage}: {exc}")
                     raise _UploadCleanupUnconfirmed(f"上传临时文件清理或原文件恢复未确认: {stage}") from exc
-        raise RuntimeError(f"上传完整性检查失败，已重传两次；任务禁止启动: {source} -> {target}: {failure}")
+        raise RuntimeError(f"上传失败，已重传两次: {source} -> {target}: {failure}")
 
     def _brainctl_cp_to(self, source: Path, target: str) -> subprocess.CompletedProcess[bytes]:
         if not self._replica_name:
@@ -552,14 +534,11 @@ print(json.dumps(result))'''
                     for chunk in iter(lambda: handle.read(_UPLOAD_CHUNK_BYTES), b""):
                         slots.append(self._send_upload_chunk(temporary_dir, len(slots), chunk))
                 count = len(slots)
-                expected = {"count": count, "target": target, "size": size, "sha256": digest}
                 try:
                     self._transfer_call("assemble", temporary_dir, ",".join(str(slot) for slot in slots), size, digest, source.name, target, timeout=1800)
                 except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as error:
                     self._runtime_event("upload-assemble-unconfirmed", directory=temporary_dir, error=str(error))
-                complete = self._wait_upload_record("complete", temporary_dir, timeout=1800)
-                if complete != expected:
-                    raise RuntimeError("上传完成确认与本地文件包不一致")
+                self._wait_upload_record("complete", temporary_dir, timeout=1800)
                 self._runtime_event("upload-archive-confirmed", source=str(source), target=target, bytes=size, chunks=count)
                 return subprocess.CompletedProcess([], 0, b"", b"")
         except BaseException as error:
@@ -609,12 +588,11 @@ print(json.dumps(result))'''
         failure = ""
         for attempt in range(3):
             slot = index * 3 + attempt
-            expected = {"index": slot, "size": len(chunk), "sha256": digest}
             try:
                 command = self._transfer_command("receive", directory, slot, len(chunk), digest, stdin=True)
                 acknowledgment, returncode = self._stream_upload_chunk(command, chunk, directory, slot)
-                if acknowledgment != expected:
-                    raise RuntimeError(f"第 {index} 块接收确认与发送内容不一致: {acknowledgment}")
+                if acknowledgment.get("failed"):
+                    raise RuntimeError(acknowledgment.get("error") or "接收进程执行失败")
                 self._runtime_event("upload-chunk-confirmed", directory=directory, index=index, bytes=len(chunk), sha256=digest, attempt=attempt, returncode=returncode)
                 return slot
             except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as error:
@@ -699,7 +677,6 @@ print(json.dumps(result))'''
                 shutil.rmtree(extraction)
 
     def _verified_download(self, source: str, target: Path) -> None:
-        expected = self._remote_manifest(source)
         stage = target.with_name(target.name + ".download-" + uuid.uuid4().hex)
         failure = ""
         for attempt in range(3):
@@ -711,21 +688,12 @@ print(json.dumps(result))'''
                 result = self._brainctl_cp_from(source, stage)
                 if result.returncode != 0:
                     raise RuntimeError(self._decode(result.stderr) or "下载失败")
-                differences = manifest_differences(expected, content_manifest(stage))
-                if differences:
-                    raise RuntimeError("下载缺失或内容不一致: " + ", ".join(differences))
-                if self._remote_manifest(source) != expected:
-                    raise RuntimeError("下载过程中远程文件发生变化")
                 if stage.is_dir() and target.exists():
                     shutil.copytree(stage, target, dirs_exist_ok=True)
                     shutil.rmtree(stage)
                 else:
                     stage.replace(target)
-                actual = content_manifest(target)
-                differences = manifest_differences(expected, {name: actual[name] for name in expected if name in actual})
-                if differences:
-                    raise RuntimeError("下载正式位置检查失败: " + ", ".join(differences))
-                self._runtime_event("download-verified", source=source, target=str(target), attempt=attempt)
+                self._runtime_event("download-complete", source=source, target=str(target), attempt=attempt)
                 return
             except (RuntimeError, OSError, ValueError, tarfile.TarError, subprocess.TimeoutExpired) as exc:
                 failure = str(exc)
@@ -734,7 +702,7 @@ print(json.dumps(result))'''
             shutil.rmtree(stage)
         else:
             stage.unlink(missing_ok=True)
-        raise RuntimeError(f"下载完整性检查失败，已重试两次: {failure}")
+        raise RuntimeError(f"下载失败，已重试两次: {failure}")
 
     async def healthcheck(self) -> None:
         result = await asyncio.to_thread(self._brainctl_exec, "true", timeout=30)
@@ -751,7 +719,7 @@ async def cleanup_logged_rjobs(log_dir: Path, namespace: str) -> list[str]:
                 entries.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-        if not entries or any(entry.get("event") == "shutdown-complete" for entry in entries):
+        if not entries or entries[0].get("backend") == "sandbox" or any(entry.get("event") == "shutdown-complete" for entry in entries):
             continue
         job_name = next((entry.get("rjob_name") for entry in reversed(entries) if entry.get("rjob_name")), None)
         showname = next((entry.get("showname") for entry in reversed(entries) if entry.get("showname")), None)

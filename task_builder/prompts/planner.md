@@ -27,7 +27,7 @@
   "verifier_metrics": {{}}
 }}
 
-顶层只允许 `problem`、`data_split`、`verifier_metrics` 三个字段，不要写 `reference_answer`。
+以上为便于阅读的组织示例，可以增加说明字段或调整结构；按科学内容组织计划，不以字段数量、枚举或路径写法判断计划是否合格。
 
 ### problem（从论文提取）
 

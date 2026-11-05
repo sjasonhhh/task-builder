@@ -10,7 +10,7 @@ import shutil
 from pathlib import Path
 
 from .agents import IndependentClaudeAgent
-from .discovery import discover_sources, read_run_names, validate_source
+from .discovery import discover_sources, read_run_names
 from .harbor_runtime import validate_with_harbor
 from .models import AgentError, PipelineConfig, SourceBundle, StageFailure, TaskTimeout, ValidationIssue, ValidationReport
 from .deadline import remaining_timeout, task_deadline
@@ -20,31 +20,13 @@ from .source_privacy import validate_public_description
 from .staging import publish_task
 from .resume import restore_source, save_run_identity
 from .usage import write_source_usage
-from .writer_agent import run_repair_writer_agent, run_writer_agent
+from .writer_agent import _missing_files, run_repair_writer_agent, run_writer_agent
 from .workspace import SourceWorkspace, create_shared_workspace, create_source_workspace, new_run_root, record_event, snapshot_draft, write_failure
-
-_REQUIRED_PUBLISHED = (
-    "task.toml",
-    "instruction.md",
-    "data",
-    "README.md",
-    "solution/solve.sh",
-    "tests/test.sh",
-)
-_FORBIDDEN_PUBLISHED = ("environment", "context", "code")
-
+from .human_review import (begin_attempt, finish_attempt, publish_staged, record_outcome,
+                           request_for, restore_for_review, select_sources)
 
 def is_complete_published_task(path: Path) -> bool:
-    if not path.is_dir():
-        return False
-    for relative in _REQUIRED_PUBLISHED:
-        candidate = path / relative
-        if relative == "data":
-            if not candidate.is_dir():
-                return False
-        elif not candidate.is_file():
-            return False
-    return not any((path / name).exists() for name in _FORBIDDEN_PUBLISHED)
+    return path.is_dir() and not _missing_files(path)
 
 
 def published_source_slugs(output_root: Path) -> set[str]:
@@ -61,6 +43,9 @@ def migrate_staged_published_tasks(output_root: Path, sources: list[SourceBundle
     source_by_slug = {source.source_slug: source for source in sources}
     final_root = output_root / "final"
     for run_dir in sorted(runs_root.iterdir(), key=lambda path: path.name):
+        # 人工修复必须核对旧版本与意见后发布，不能由普通续跑迁移绕过。
+        if (run_dir / "human-review-run.json").exists() or (run_dir / "sandbox-dispatch.json").exists():
+            continue
         published_dir = run_dir / "published"
         if not published_dir.is_dir():
             continue
@@ -97,10 +82,12 @@ def _failure_text(failure: StageFailure | None, reports: list[ValidationReport])
 
 def _cleanup_validation_jobs(workspace: SourceWorkspace, config: PipelineConfig) -> None:
     from .hcluster_runtime import cleanup_logged_rjobs
+    from .sandbox_runtime import cleanup_logged_sandboxes
 
     failures = []
     for log_dir in workspace.validation_dir.rglob("runtime-logs"):
         failures.extend(asyncio.run(cleanup_logged_rjobs(log_dir, config.namespace)))
+        failures.extend(asyncio.run(cleanup_logged_sandboxes(log_dir)))
     if failures:
         raise StageFailure("集群资源未确认关闭，不再启动新验证：" + "; ".join(failures), stage="infrastructure")
 
@@ -161,6 +148,9 @@ def _process_source(source: SourceBundle, config: PipelineConfig, run_root: Path
             return _process_source_work(source, config, run_root, staging_output)
     except BaseException as error:
         source_root = run_root / "workspace" / "sources" / source.source_slug
+        from types import SimpleNamespace
+
+        record_outcome(SimpleNamespace(reviews_dir=source_root / "reviews"), "failed", error=str(error))
         if isinstance(error, TaskTimeout):
             from .model_relay import redact_model_secrets
 
@@ -187,7 +177,12 @@ def _process_source_work(source: SourceBundle, config: PipelineConfig, run_root:
     workspace = create_source_workspace(run_root, shared_dir, source)
     record_event(workspace, "source-started", source=str(source.source_dir), slug=source.source_slug)
     agent = IndependentClaudeAgent(claude_bin=config.claude_bin, timeout_sec=config.agent_timeout_sec)
-    plan_reused, draft_reused = restore_source(source, workspace, config)
+    human_request = request_for(config, source.source_slug)
+    if human_request:
+        restore_for_review(source, config, workspace)
+        plan_reused, draft_reused = True, True
+    else:
+        plan_reused, draft_reused = restore_source(source, workspace, config)
     if config.local_only:
         from .local_validation import validate_local_source
 
@@ -207,7 +202,14 @@ def _process_source_work(source: SourceBundle, config: PipelineConfig, run_root:
     while True:
         try:
             remaining_timeout(1)
-            passed, failure, reports = _run_validation_cycle(source, config, workspace, agent, cycle)
+            if human_request and cycle == 0:
+                passed, failure, reports = False, StageFailure(human_request["opinion"], stage="human-review"), []
+            else:
+                passed, failure, reports = _run_validation_cycle(source, config, workspace, agent, cycle)
+                if human_request:
+                    record_outcome(workspace, "validated" if passed else "validation-failed", cycle=cycle,
+                                   error=str(failure) if failure else None,
+                                   reports=[report.text for report in reports])
         except TaskTimeout:
             raise
         except Exception as exc:
@@ -240,16 +242,24 @@ def _process_source_work(source: SourceBundle, config: PipelineConfig, run_root:
                 raise StageFailure(f"来源 {source.source_slug} 超过最大修复次数 {revision_limit}（共 {revision_limit + 1} 次检查）:\n{text}", stage=failure.stage if failure else "validation")
             snapshot = snapshot_draft(workspace, cycle)
             record_event(workspace, "repair-started", cycle=cycle, snapshot=str(snapshot))
+            attempt = begin_attempt(workspace, cycle)
+            repair_error = None
             try:
                 run_repair_writer_agent(source, config, workspace, agent, text)
             except StageFailure as exc:
-                if exc.stage != "repair-writer" or isinstance(exc.__cause__, AgentError):
+                repair_error = str(exc)
+                if exc.stage in {"infrastructure", "proxy"} or isinstance(exc, TaskTimeout) or isinstance(exc.__cause__, AgentError):
                     raise
                 cycle += 1
                 text = f"{text}\n\n上一次修复未被接受（草稿与计划未改动），请据此重新修复：\n{exc}"
                 write_failure(workspace, cycle, "repair-rejected", text)
                 record_event(workspace, "repair-rejected", cycle=cycle, error=str(exc))
                 continue
+            except BaseException as exc:
+                repair_error = str(exc)
+                raise
+            finally:
+                finish_attempt(workspace, attempt, repair_error)
             record_event(workspace, "repair-writer-passed", cycle=cycle)
             cycle += 1
             break
@@ -356,12 +366,23 @@ def _run_sources(
     run_root: Path,
     staging_output: Path,
 ) -> tuple[list[Path], list[str]]:
+    if config.extra.get("sandbox_dispatch"):
+        from .sandbox_dispatch import run_sources_in_sandboxes
+
+        return run_sources_in_sandboxes(sources, config, run_root, staging_output)
     if config.concurrency == 1:
         return _run_sources_sequential(sources, config, run_root, staging_output)
     return _run_sources_parallel(sources, config, run_root, staging_output)
 
 
 def run_pipeline(config: PipelineConfig) -> list[Path]:
+    if getattr(config, "sandbox", False) and not config.local_only:
+        from .sandbox_runtime import preflight_sandbox
+
+        try:
+            preflight_sandbox()
+        except Exception as exc:
+            raise StageFailure(f"沙盒登录或资源池检查失败：{exc}", stage="infrastructure") from None
     if config.run_txt:
         candidates = discover_sources(config.input_root, validate=False)
         source_by_name = {source.source_dir.name: source for source in candidates}
@@ -373,11 +394,18 @@ def run_pipeline(config: PipelineConfig) -> list[Path]:
                 all_sources.append(source_by_name[name])
     else:
         all_sources = discover_sources(config.input_root)
-    if config.resume_from is None and not config.local_only:
+    human_review = getattr(config, "human_review", False)
+    if config.resume_from is None and not config.local_only and not human_review:
         migrate_staged_published_tasks(config.output_root, all_sources)
     complete = set() if not config.run_txt and (config.resume_from or config.local_only) else published_source_slugs(config.output_root)
-    sources = [source for source in all_sources if source.source_slug not in complete]
+    selection_errors = []
+    if human_review:
+        sources, selection_errors = select_sources(all_sources, config, published_source_slugs(config.output_root))
+    else:
+        sources = [source for source in all_sources if source.source_slug not in complete]
     if not sources:
+        if selection_errors:
+            raise StageFailure("人工审核记录有误:\n" + "\n".join(selection_errors), stage="human-review")
         if config.run_txt:
             print("没有待运行任务", flush=True)
         return []
@@ -385,38 +413,30 @@ def run_pipeline(config: PipelineConfig) -> list[Path]:
         from .model_relay import prepare_model_relay
 
         prepare_model_relay(config)
-    if config.run_txt:
-        for source in sources:
-            validate_source(source)
     run_root = new_run_root(config.output_root)
+    if human_review:
+        (run_root / "human-review-run.json").write_text(json.dumps({"sources": [source.source_slug for source in sources]}, ensure_ascii=False), encoding="utf-8")
     staging_output = run_root / "published"
     staging_output.mkdir(parents=True, exist_ok=True)
     create_shared_workspace(run_root, config)
     save_run_identity(run_root, config)
     outputs, failures = _run_sources(sources, config, run_root, staging_output)
+    failures = selection_errors + failures
     if config.local_only:
         (run_root / "local-summary.json").write_text(json.dumps({"sources": [str(path) for path in outputs], "failures": failures, "remote_validated": False}, ensure_ascii=False, indent=2), encoding="utf-8")
         if failures:
             raise StageFailure("本地恢复失败:\n" + "\n".join(failures), stage="resume")
         return outputs
-    if outputs:
-        final_root = config.output_root / "final"
-        final_root.mkdir(parents=True, exist_ok=True)
-        for staged in outputs:
-            target = final_root / staged.name
-            backup = run_root / f"previous-{staged.name}"
-            moved_old = False
-            try:
-                if target.exists():
-                    target.rename(backup)
-                    moved_old = True
-                staged.rename(target)
-            except OSError:
-                if moved_old and backup.exists() and not target.exists():
-                    backup.rename(target)
-                raise
-            if backup.exists():
-                shutil.rmtree(backup)
+    for staged in outputs:
+        from types import SimpleNamespace
+
+        review_workspace = SimpleNamespace(reviews_dir=run_root / "workspace" / "sources" / staged.name / "reviews")
+        try:
+            target = publish_staged(staged, config, run_root)
+            record_outcome(review_workspace, "pending-human-review", published=str(target))
+        except (StageFailure, OSError) as exc:
+            record_outcome(review_workspace, "publish-failed", error=str(exc))
+            failures.append(f"{staged.name}: {exc}")
     if failures:
         raise StageFailure("部分来源未发布:\n" + "\n".join(failures), stage="pipeline")
     return [config.output_root / "final" / source.source_slug for source in sources if source.source_slug in {path.name for path in outputs}]

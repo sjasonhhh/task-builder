@@ -1,0 +1,33 @@
+# chemistry 制药共享实验环境；task-builder 通过 --sci-env chemistry 使用。
+# 基础环境：Debian 12、Python 3.11.17、PyTorch 2.4.1+cu121。
+# 科研软件：RDKit、NumPy、pandas、SciPy、scikit-learn、matplotlib、seaborn、
+# openpyxl、SELFIES、DeepSMILES；所需版本见 requirements-experiment.txt。
+# 支持分子结构/骨架/片段处理、分子性质的基础预测、生成分子的有效性与分布分析。
+# 已验证范围为上述轻量分析操作，不代表参考论文的全部深度学习训练脚本均可运行。
+# 底座保留 Claude Code 2.1.301、Harbor 0.22.0、uv、rjob 及生物学科研软件。
+# 不升级底座已有 Python 包；仅补充缺少的依赖。
+ARG BASE_IMAGE=registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting@sha256:81c0a891077a326bef1e96c9b98a4f825e0d1e15ce13f97bfa04a55d5cbab112
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 update \
+    && apt-get install -y --no-install-recommends tmux less \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+# 配置直接写入镜像，使 task-builder 复制六个标准环境文件后仍可独立构建。
+RUN printf '%s\n' \
+    'set -g mouse on' \
+    'set -g history-limit 100000' \
+    'setw -g mode-keys vi' \
+    'set -g default-terminal "screen-256color"' \
+    'set -g allow-rename off' > /etc/tmux.conf
+COPY requirements-experiment.txt /tmp/chemistry-requirements.txt
+RUN python -m pip freeze > /tmp/base-constraints.txt \
+    && python -m pip install --no-cache-dir --prefer-binary --index-url http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/ --trusted-host mirrors.i.h.pjlab.org.cn -c /tmp/base-constraints.txt -r /tmp/chemistry-requirements.txt \
+    && mkdir -p /opt/chemistry /workspace /app/results /logs/verifier \
+    && python -m pip freeze > /opt/chemistry/installed.txt \
+    && rm /tmp/base-constraints.txt /tmp/chemistry-requirements.txt \
+    && claude --version && tmux -V
+# Harbor 的 Dockerfile 解析器属于可选依赖；编排环境也预装 pip，避免运行时补装。
+RUN /opt/orch/venv/bin/python -m ensurepip --upgrade \
+    && /opt/orch/venv/bin/python -m pip install --no-cache-dir dockerfile-parse==2.0.1 \
+    && /opt/orch/venv/bin/python -m pip check
+WORKDIR /workspace

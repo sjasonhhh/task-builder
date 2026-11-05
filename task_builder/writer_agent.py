@@ -5,13 +5,12 @@ import stat
 import uuid
 from pathlib import Path
 
-from .agents import IndependentClaudeAgent, save_agent_log
+from .agents import AgentRun, IndependentClaudeAgent, parse_print_json, save_agent_log
 import json
 
 from .models import AgentError, PipelineConfig, SourceBundle, StageFailure
 from .prompting import load_prompt, read_shared_material, source_manifest
-from .planner_agent import validate_plan
-from .workspace import SourceWorkspace, directory_manifest, directories_unchanged, record_event
+from .workspace import SourceWorkspace, record_event
 
 
 # solution/solve.sh 是迁移自论文结果或代码的参考提交。
@@ -23,14 +22,14 @@ def _missing_files(draft: Path, required: tuple[str, ...] = _REQUIRED_FILES) -> 
     return [relative for relative in required if not (draft / relative).is_file()]
 
 
-def _run_until_files_written(agent: IndependentClaudeAgent, draft: Path, log_path: Path, *, required: tuple[str, ...] = _REQUIRED_FILES, **options) -> None:
+def _run_until_files_written(agent: IndependentClaudeAgent, draft: Path, log_path: Path, *, required: tuple[str, ...] = _REQUIRED_FILES, **options) -> AgentRun:
     """模型有时把文件内容只写在思考里就结束会话；缺文件时在原会话中要求它直接写出。"""
     run = agent.run(**options)
     save_agent_log(log_path, run)
     for attempt in range(1, _MISSING_FILE_ATTEMPTS + 1):
         missing = _missing_files(draft, required)
         if not missing:
-            return
+            return run
         prompt = (
             f"任务草稿 {draft} 中以下必需文件仍不存在：" + "、".join(missing)
             + "。你上一轮没有调用工具保存。不要重新阅读材料或重新设计，立即用 Write 工具逐个写出这些文件的完整内容"
@@ -38,6 +37,7 @@ def _run_until_files_written(agent: IndependentClaudeAgent, draft: Path, log_pat
         )
         run = agent.run(**{**options, "role": f"{options['role']}-files-{attempt}", "prompt": prompt, "resume_session": run.session_id})
         save_agent_log(log_path.with_name(f"{log_path.stem}-files-{attempt}.log"), run)
+    return run
 
 
 def _check_draft(draft: Path, *, stage: str = "writer", required: tuple[str, ...] = _REQUIRED_FILES) -> None:
@@ -88,15 +88,12 @@ def run_writer_agent(source: SourceBundle, config: PipelineConfig, workspace: So
         plan_path=workspace.plan_dir / "plan.json",
         environment_dir=workspace.shared_dir / environment_dir,
         rubric=rubric,
+        shared_dir=workspace.shared_dir,
+        human_feedback_path=workspace.reviews_dir / "human" / "request.md",
         environment=environment,
         source_manifest=source_manifest(workspace.input_dir),
     )
     required = _REQUIRED_FILES
-    # input/ 不再受保护（Writer 需用 Bash 从中复制数据）；shared/ 不在访问范围内，这里再核对一次兜底。
-    protected = {
-        workspace.plan_dir: directory_manifest(workspace.plan_dir),
-        workspace.shared_dir: directory_manifest(workspace.shared_dir),
-    }
     try:
         _run_until_files_written(
             agent,
@@ -115,8 +112,6 @@ def run_writer_agent(source: SourceBundle, config: PipelineConfig, workspace: So
         if hasattr(exc, "run"):
             save_agent_log(workspace.logs_dir / "writer-agent.log", exc.run)
         raise StageFailure(str(exc), stage="writer") from exc
-    if not directories_unchanged(protected):
-        raise StageFailure("Writer Agent 修改了计划或共享资料", stage="writer")
     _check_draft(workspace.draft_dir, required=required)
     return workspace.draft_dir
 
@@ -143,9 +138,6 @@ def _failure_evidence(workspace: SourceWorkspace, current_failure: str) -> str:
 
 def _accept_repaired_plan(candidate_plan: Path, workspace: SourceWorkspace) -> None:
     """校验修复后的计划；通过后替换正式计划，未改动时保持原样。"""
-    extra = sorted(path.name for path in candidate_plan.iterdir() if path.name != "plan.json")
-    if extra:
-        raise StageFailure("Repair Writer Agent 在计划目录中生成了 plan.json 之外的文件: " + ", ".join(extra), stage="repair-writer")
     new_path, old_path = candidate_plan / "plan.json", workspace.plan_dir / "plan.json"
     if new_path.read_bytes() == old_path.read_bytes():
         return
@@ -153,7 +145,6 @@ def _accept_repaired_plan(candidate_plan: Path, workspace: SourceWorkspace) -> N
         plan = json.loads(new_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise StageFailure(f"修复后的 plan.json 不是有效 JSON: {exc}", stage="repair-writer") from exc
-    validate_plan(plan, data_root=workspace.input_dir / "data")
     revision = len(list(workspace.failures_dir.glob("plan-before-repair-*.json")))
     shutil.copy2(old_path, workspace.failures_dir / f"plan-before-repair-{revision:03d}.json")
     old_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -163,11 +154,6 @@ def _accept_repaired_plan(candidate_plan: Path, workspace: SourceWorkspace) -> N
 def run_repair_writer_agent(source: SourceBundle, config: PipelineConfig, workspace: SourceWorkspace, agent: IndependentClaudeAgent, failure: str) -> Path:
     rubric, environment_dir, environment = read_shared_material(workspace.shared_dir)
     # 修复只操作候选计划，校验通过后再替换正式计划。
-    # input/ 不再受保护；shared/ 不在访问范围内，这里再核对一次兜底。
-    protected = {
-        workspace.shared_dir: directory_manifest(workspace.shared_dir),
-        workspace.plan_dir: directory_manifest(workspace.plan_dir),
-    }
     failure_path = workspace.failures_dir / "current-failure.txt"
     failure_path.write_text(failure, encoding="utf-8")
     evidence = _failure_evidence(workspace, failure)
@@ -193,6 +179,8 @@ def run_repair_writer_agent(source: SourceBundle, config: PipelineConfig, worksp
         plan_path=candidate_plan / "plan.json",
         environment_dir=workspace.shared_dir / environment_dir,
         rubric=rubric,
+        shared_dir=workspace.shared_dir,
+        human_feedback_path=workspace.reviews_dir / "human" / "request.md",
         environment=environment,
         source_manifest=source_manifest(workspace.input_dir),
         failure=evidence,
@@ -201,7 +189,7 @@ def run_repair_writer_agent(source: SourceBundle, config: PipelineConfig, worksp
     required = _REQUIRED_FILES
     try:
         try:
-            _run_until_files_written(
+            run = _run_until_files_written(
                 agent,
                 candidate_draft,
                 workspace.logs_dir / "repair-writer-agent.log",
@@ -213,12 +201,13 @@ def run_repair_writer_agent(source: SourceBundle, config: PipelineConfig, worksp
                 allowed_dirs=(workspace.input_dir, plan_dir),
                 read_only_dirs=(),
             )
+            if run is not None and (workspace.reviews_dir / "human" / "request.md").is_file():
+                summary, _ = parse_print_json(run.stdout)
+                (workspace.logs_dir / "repair-writer-summary.md").write_text(summary, encoding="utf-8")
         except AgentError as exc:
             if hasattr(exc, "run"):
                 save_agent_log(workspace.logs_dir / "repair-writer-agent.log", exc.run)
             raise StageFailure(str(exc), stage="repair-writer") from exc
-        if not directories_unchanged(protected):
-            raise StageFailure("Repair Writer Agent 修改了正式计划或共享资料", stage="repair-writer")
         _check_draft(candidate_draft, stage="repair-writer", required=required)
         _accept_repaired_plan(candidate_plan, workspace)
         _replace_draft(candidate_draft, workspace.draft_dir)

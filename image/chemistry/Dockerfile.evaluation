@@ -1,0 +1,14 @@
+# chemistry 共享评测环境：复用实验镜像的软件版本和 tmux 配置，工作目录为 /tests。
+# 可读取分子结构和表格数据、重算统计/预测指标；所需版本见 requirements-evaluation.txt。
+# 当前评测镜像继承完整实验环境，并非单独裁剪的轻量评分镜像。
+# 独立构建默认使用已发布的实验镜像；构建脚本可传入本次新生成的实验镜像。
+ARG BASE_IMAGE=registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting@sha256:705b61787ee07f7c358323c10eda3b2ec278b49c12e1d193d58f1bbf491c1afc
+FROM ${BASE_IMAGE}
+USER root
+COPY requirements-evaluation.txt /tmp/chemistry-requirements.txt
+RUN python -m pip install --no-index --no-cache-dir -r /tmp/chemistry-requirements.txt \
+    && mkdir -p /tests /app/results /logs/verifier \
+    && python -m pip freeze > /opt/chemistry/installed.txt \
+    && rm /tmp/chemistry-requirements.txt \
+    && claude --version && tmux -V
+WORKDIR /tests

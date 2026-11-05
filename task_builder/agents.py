@@ -65,16 +65,22 @@ def record_usage(path: Path, run: AgentRun) -> None:
 
 _INLINE_SETTINGS_LIMIT = 100_000
 _BINARY_SUFFIXES = {".pdf", ".h5", ".h5ad", ".gz", ".zip", ".7z", ".npz", ".npy", ".pkl", ".rds", ".bam"}
-_TEXT_SUFFIXES = {".py", ".sh", ".m", ".c", ".h", ".md", ".toml", ".json"}
-# 预处理论文目录中的图表、表格和链接都要能被 Read 读取（图片由 Read 直接显示）。
-_CONTEXT_SUFFIXES = {".md", ".json", ".csv", ".tsv", ".txt", ".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp"}
+_READ_MAX_OUTPUT_TOKENS = 8000
+_READ_GUIDANCE = """
+统一文件读取规则：
+- TXT、CSV、TSV、JSONL、SMILES、SDF、FASTA 等文本数据可以用 Read 分段读取，不因整个文件较大而禁止读取。
+- 查看数据时先指定 offset=1、limit=50；需要更多内容再调整 offset，每次 limit 不超过 200 行。源码和论文长文也按段读取。
+- 不使用 allow_large 绕过单次读取量限制；若 Read 提示内容过长，减小 limit，不要重复请求全文。Grep 查内容时设置 head_limit，先查看少量匹配。
+- 先用提供的文件清单或 Glob 确认真实路径；文件不存在时不要反复尝试同一路径。作者代码引用的预测结果可能需要先运行代码才会生成，不能当作已有输入。
+- plan.json 等本阶段要创建的文件尚不存在时，直接用 Write 创建；后续修改前先 Read。
+- 压缩包、HDF5、NumPy 等二进制文件不要直接交给 Read/Grep。依据文件清单、说明及源码判断格式；只有已获准使用 Bash 的阶段才能用现有工具做有限的解压或数据预览。
+""".strip()
 
 
 def _deny_read(path: Path) -> bool:
-    suffix = path.suffix.lower()
-    if "context" in path.parts and suffix in _CONTEXT_SUFFIXES:
-        return False
-    return suffix in _BINARY_SUFFIXES or path.stat().st_size > 16000 and suffix not in _TEXT_SUFFIXES
+    # A deny rule blocks the whole file, even Read(offset=1, limit=5).
+    # Limit text through Read's output budget instead of the file's disk size.
+    return path.suffix.lower() in _BINARY_SUFFIXES
 
 
 class IndependentClaudeAgent:
@@ -133,12 +139,13 @@ class IndependentClaudeAgent:
             *tools,
         ]
         command_parts.extend(("--restricted", "--permission-prompts", "none"))
+        prompt += "\n\n" + _READ_GUIDANCE
         if role.startswith("planner"):
             prompt += "\n立即完成并保存 plan.json；论文正文读 context/text.md，图表按需读 context/figures/ 与 context/tables/。不得遍历全部数据文件；根据论文评估章节和必要源码完成计划。"
         elif not reviewer_only:
             prompt += "\n立即创建并保存五个必需文件，先 Read plan.json，再用 Write。论文正文读 context/text.md；不要重复阅读数据预览。禁止执行科研计算和生成答案结果；只写可以后续运行的程序。"
         if writes_data:
-            prompt += "\n使用 Bash 时每次只执行一条命令，不要用 &&、;、| 连接多条命令。数据文件用 cp 复制、mv 改名；修改数据时生成新文件，不要原地改写来源文件；二进制或大数据文件不要用 Read 读全文，只用 head、zcat 或 python3 查看片段。"
+            prompt += "\n使用 Bash 时每次只执行一条命令，不要用 &&、;、| 连接多条命令。数据文件用 cp 复制、mv 改名；修改数据时生成新文件，不要原地改写来源文件。文本数据可用 Read 分段预览；压缩或二进制数据用 zcat 或 python3 等现有工具有限预览，不进行科研计算。"
         settings = dict(model_settings)
         permissions: dict[str, list[str]] = {}
         if writes_data:
@@ -181,7 +188,7 @@ class IndependentClaudeAgent:
                 "Bash(/usr/bin/python3 * && *)",
             ]
         # Claude Code 会用 Edit/Read 拒绝规则核对 Bash 命令里的全部路径参数，cp 来源数据也会被拒。
-        # Writer/Repair 因此不加这两类规则：只读目录由运行后的 directories_unchanged 核对兜底。
+        # Writer/Repair 因此不加这两类规则。
         if resolved_read_only_dirs and not writes_data:
             permissions["deny"] = [
                 f"Edit(//{path.as_posix().lstrip('/')}/**)"
@@ -225,6 +232,15 @@ class IndependentClaudeAgent:
 
     def _execute(self, role, session_id, command, prompt, workdir, env_config, resume_session, safe_output) -> AgentRun:
         environment = environment_for_subprocess(env_config)
+        # This native Claude Code limit works in --bare mode too. A smaller
+        # user limit is preserved; oversized reads can retry with fewer lines.
+        try:
+            read_limit = int(environment.get("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", ""))
+        except ValueError:
+            read_limit = _READ_MAX_OUTPUT_TOKENS
+        environment["CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"] = str(
+            min(read_limit, _READ_MAX_OUTPUT_TOKENS) if read_limit > 0 else _READ_MAX_OUTPUT_TOKENS
+        )
         environment.setdefault("API_TIMEOUT_MS", _API_TIMEOUT_MS)
         environment.setdefault("CLAUDE_CODE_MAX_RETRIES", _API_MAX_RETRIES)
         usage_total: dict | None = None
@@ -345,26 +361,6 @@ def extract_json(text: str) -> dict:
             if isinstance(value, dict):
                 return value
     raise AgentError("agent 输出不是有效 JSON")
-
-
-# 结论已在会话中，但输出不是合法 JSON 时，让同一会话只重新输出 JSON，不重做判断。
-JSON_REFORMAT_PROMPT = (
-    "你上一条输出不是合法 JSON，程序无法解析。不要重新分析，也不要改变结论；"
-    "把上一条结果原样整理成一个完整的 JSON 对象重新输出：以 { 开头、以 } 结尾，"
-    "字符串内部不要出现未转义的 ASCII 双引号或换行，引用术语用中文引号“”。只输出 JSON。"
-)
-
-
-def run_agent_expecting_json(agent: "IndependentClaudeAgent", *, role: str, prompt: str, log_path: Path, **options) -> tuple[AgentRun, dict]:
-    """运行 agent 并解析其 JSON 输出；首次解析失败时在同一会话内要求重新输出 JSON。"""
-    run = agent.run(role=role, prompt=prompt, **options)
-    save_agent_log(log_path, run)
-    try:
-        return run, extract_json(run.stdout)
-    except AgentError:
-        retry = agent.run(role=f"{role}-json", prompt=JSON_REFORMAT_PROMPT, resume_session=run.session_id, **options)
-        save_agent_log(log_path.with_name(f"{log_path.stem}-json.log"), retry)
-        return retry, extract_json(retry.stdout)
 
 
 def save_agent_log(path: Path, run: AgentRun) -> None:

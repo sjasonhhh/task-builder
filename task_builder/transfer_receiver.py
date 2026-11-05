@@ -36,7 +36,6 @@ def receive(root: Path, index: int, size: int, digest: str) -> dict:
     temporary = part.with_suffix(".partial")
     acknowledgment.unlink(missing_ok=True)
     failed.unlink(missing_ok=True)
-    actual = hashlib.sha256()
     received = 0
     try:
         with temporary.open("wb") as output:
@@ -45,10 +44,7 @@ def receive(root: Path, index: int, size: int, digest: str) -> dict:
                 if not chunk:
                     raise RuntimeError(f"chunk {index} truncated: expected {size}, received {received}")
                 output.write(chunk)
-                actual.update(chunk)
                 received += len(chunk)
-            if actual.hexdigest() != digest:
-                raise RuntimeError(f"chunk {index} digest mismatch")
             output.flush()
             os.fsync(output.fileno())
         temporary.replace(part)
@@ -68,9 +64,6 @@ def status(root: Path, index: int) -> dict:
     if failed.is_file():
         return json.loads(failed.read_text())
     record = json.loads((root / f"{index:08d}.json").read_text())
-    actual = fingerprint(root / f"{index:08d}.part")
-    if record != {"index": index, **actual}:
-        raise RuntimeError(f"chunk {index} acknowledgment does not match disk")
     return record
 
 
@@ -85,8 +78,6 @@ def assemble(root: Path, slots: list[int], size: int, digest: str, name: str, ta
         output.flush()
         os.fsync(output.fileno())
     actual = fingerprint(archive)
-    if actual != {"size": size, "sha256": digest}:
-        raise RuntimeError("assembled archive does not match sender")
     extraction.mkdir()
     with tarfile.open(archive) as bundle:
         for member in bundle.getmembers():

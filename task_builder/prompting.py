@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import stat
+import os
 from pathlib import Path
 
 import json
@@ -25,7 +26,25 @@ def load_prompt(name: str, **values: object) -> str:
         "task_data_manifest": "<任务 data/ 最终文件清单未提供>",
     }
     defaults.update(values)
-    return template.format(**{key: str(value) for key, value in defaults.items()})
+    prompt = template.format(**{key: str(value) for key, value in defaults.items()})
+    if os.environ.get("TASK_BUILDER_CPU_ONLY") == "1":
+        prompt += ("\n\n本轮通过 CPU 沙盒运行：任务 task.toml 的 [environment].gpus 必须为 0。"
+                   "选择可在 CPU 上完成的科研任务；不得要求 CUDA 或 GPU。"
+                   "如果论文任务必须使用 GPU，请明确报告不支持，不得假装已运行或验证。")
+    shared_dir = values.get("shared_dir")
+    advice = Path(shared_dir) / "human_advise.md" if shared_dir else None
+    if advice is not None and advice.is_file():
+        text = advice.read_text(encoding="utf-8").strip()
+        if text:
+            prompt += "\n\n领域专家建议（补充领域要求，不替代或放宽 rubric 的硬性规则）：\n" + text
+    feedback_path = values.get("human_feedback_path")
+    if feedback_path and Path(feedback_path).is_file() and name in {"repair.md", "reviewer.md"}:
+        prompt += "\n\n本轮人工审核原始记录：\n" + Path(feedback_path).read_text(encoding="utf-8")
+        if name == "repair.md":
+            prompt += "\n逐条处理修改意见，同步更新 README 现有相关章节，不新增审核章节。最后用简短文字逐条说明已修改内容、依据及仍未解决的问题；不要声称人工已通过。"
+        else:
+            prompt += "\n逐条核对人工修改意见是否解决；未解决的有效要求列入 blocking_issues。意见与 rubric 冲突时说明冲突，不得放宽硬性规则。审核提示不是必须执行的修改意见。"
+    return prompt
 
 
 def source_manifest(input_dir: Path) -> str:
@@ -82,33 +101,27 @@ def task_data_manifest(source_data: Path, draft_dir: Path, plan_path: Path) -> s
     if not lines:
         return "<任务 data/ 为空>"
     if plan_path.is_file():
-        leaked = leaked_withheld_files(draft_data, source_data, json.loads(plan_path.read_text(encoding="utf-8")))
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except ValueError:
+            plan = {}
+        leaked = leaked_withheld_files(draft_data, source_data, plan)
         lines.append("程序核对：" + ("以下文件与计划标为 author_result / evaluation_reference 的来源文件内容相同：" + ", ".join(leaked) if leaked else "没有文件与计划标为 author_result / evaluation_reference 的来源文件内容相同"))
     return "\n".join(lines)
 
 
 def _shared_environment_dir(shared_dir: Path) -> Path:
-    candidates = [
-        path
-        for path in sorted(shared_dir.iterdir(), key=lambda item: item.name)
-        if path.is_dir() and all((path / name).is_file() for name in ENVIRONMENT_FILES)
-    ]
-    if len(candidates) != 1:
-        raise RuntimeError(
-            "shared 中必须恰好有一个完整共享环境目录，当前为: "
-            + (", ".join(str(path) for path in candidates) or "无")
-        )
-    return candidates[0]
+    candidates = sorted(path for path in shared_dir.iterdir() if path.is_dir())
+    return max(candidates, key=lambda path: sum((path / name).is_file() for name in ENVIRONMENT_FILES)) if candidates else shared_dir
 
 
 def read_shared_material(shared_dir: Path) -> tuple[str, str, str]:
     rubrics = sorted(path for path in shared_dir.glob("rubric.*") if path.is_file())
-    if len(rubrics) != 1:
-        raise RuntimeError("shared 中必须恰好有一份规则文件，当前为: " + (", ".join(path.name for path in rubrics) or "无"))
-    rubric = rubrics[0].read_text(encoding="utf-8")
+    rubric = "\n\n".join(path.read_text(encoding="utf-8") for path in rubrics)
     environment_dir = _shared_environment_dir(shared_dir)
     environment_parts = []
     for name in ENVIRONMENT_FILES:
         path = environment_dir / name
-        environment_parts.append(f"===== {name} =====\n{path.read_text(encoding='utf-8')}")
+        if path.is_file():
+            environment_parts.append(f"===== {name} =====\n{path.read_text(encoding='utf-8')}")
     return rubric, environment_dir.name, "\n\n".join(environment_parts)

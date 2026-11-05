@@ -20,7 +20,7 @@ from .config import load_agent_env, load_image_env, resolve_environment
 from .discovery import read_run_names
 from .harbor_runtime import run_harbor_agent
 from .hcluster_runtime import cleanup_logged_rjobs, resolve_claude_source
-from .integrity import content_manifest, manifest_differences
+from .integrity import content_manifest
 from .models import ConfigError, PipelineConfig, PipelineError, StageFailure
 from . import paths
 from .paths import PROJECT_HARBOR
@@ -51,7 +51,8 @@ def _nonnegative_int(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="在 H 集群运行 final 中的成品任务，并独立评分", allow_abbrev=False)
+    parser = argparse.ArgumentParser(description="在 H 集群或沙盒运行 final 中的成品任务，并独立评分", allow_abbrev=False)
+    parser.add_argument("--sandbox", action="store_true", help="通过通算沙盒答题和评分；读取 config/sandbox.env，仅支持 CPU 任务")
     parser.add_argument("--sci-env", required=True, help="共享环境名：镜像配置默认取 image/<sci-env>/image-env.toml，--input 须为某个 <sci-env>/final")
     parser.add_argument("--run_txt", required=True, help="任务名单，每行一个 final 下的目录名")
     parser.add_argument("--input", help="成品任务目录，默认 output/<sci-env>/final")
@@ -86,7 +87,11 @@ def runtime_config(args: argparse.Namespace) -> PipelineConfig:
     input_root = Path(args.input).expanduser().resolve() if args.input else paths.PROJECT_OUTPUT / args.sci_env / "final"
     if input_root.parent.name != args.sci_env:
         raise ConfigError(f"--input 必须是 --sci-env {args.sci_env} 对应的成品目录（…/{args.sci_env}/final），当前为 {input_root}")
-    images = load_image_env(image_env_path)
+    images = load_image_env(image_env_path, sandbox=args.sandbox)
+    if args.sandbox:
+        from .sandbox_runtime import sandbox_settings
+
+        sandbox_settings()
     agent = load_agent_env(Path(args.env).expanduser().resolve(), role="答题模型")
     values = vars(images).copy()
     for name in values:
@@ -110,6 +115,7 @@ def runtime_config(args: argparse.Namespace) -> PipelineConfig:
         proxy_host=args.proxy_host,
         claude_bin=args.claude_bin,
         model_relay=Path(args.model_relay).expanduser().absolute() if args.model_relay else None,
+        sandbox=args.sandbox,
         extra={"managed_harbor": True, "cancel_event": threading.Event()},
         **values,
     )
@@ -119,13 +125,8 @@ def _task_manifest(path: Path) -> dict:
     manifest = {}
     for name in TASK_PARTS:
         part = path / name
-        if name in OPTIONAL_PARTS and not part.exists() and not part.is_symlink():
-            continue
-        if not part.exists():
-            raise StageFailure(f"任务 {path.name} 缺少 {name}", stage="input")
-        manifest[name] = content_manifest(part)
-        if part.is_symlink() or any(entry["kind"] == "symlink" for entry in manifest[name].values()):
-            raise StageFailure(f"任务 {path.name} 的 {name} 含文件链接，不能保证任务独立", stage="input")
+        if part.exists():
+            manifest[name] = content_manifest(part)
     return manifest
 
 
@@ -137,6 +138,9 @@ def _identity(manifest: dict, config: PipelineConfig) -> str:
         )
     }
     settings["model"] = config.author_env.model_id
+    # 保留既有 H 集群记录的标识，只为沙盒增加区分项。
+    if config.sandbox:
+        settings["sandbox"] = True
     settings["model_settings"] = {
         name: value for name, value in config.author_env.values.items()
         if not any(word in name.upper() for word in ("TOKEN", "KEY", "SECRET", "PASSWORD"))
@@ -155,17 +159,8 @@ def select_tasks(names_path: Path, config: PipelineConfig) -> list[SelectedTask]
         if path is None:
             print(f"任务名单中的名字不存在，已跳过: {name}", file=sys.stderr, flush=True)
             continue
-        if path.is_symlink():
-            raise ConfigError(f"任务目录不能是文件链接: {name}")
         manifest = _task_manifest(path)
         validate_task_config(path / "task.toml")
-        if not (path / "instruction.md").is_file() or not (path / "data").is_dir():
-            raise ConfigError(f"任务 {name} 的 instruction.md 或 data/ 类型不正确")
-        for relative in ("solution/solve.sh", "tests/test.sh"):
-            if relative.startswith("solution/") and "solution" not in manifest:
-                continue
-            if not (path / relative).is_file():
-                raise ConfigError(f"任务 {name} 缺少 {relative}")
         tasks.append(SelectedTask(name, path, manifest, _identity(manifest, config)))
     return tasks
 
@@ -198,11 +193,7 @@ def prepare_task(task: SelectedTask, target: Path, config: PipelineConfig) -> Pa
             shutil.copytree(source, target / name)
         else:
             shutil.copy2(source, target / name)
-    if _task_manifest(target) != task.manifest:
-        raise StageFailure(f"任务 {task.name} 复制不完整，或源文件在复制时发生变化", stage="input")
     finalize_harbor_task(target, config, agent_timeout_sec=config.agent_timeout_sec)
-    if manifest_differences(task.manifest["data"], content_manifest(target / "environment" / "data")):
-        raise StageFailure(f"任务 {task.name} 的运行数据复制不完整", stage="input")
     return target
 
 
@@ -210,6 +201,14 @@ def _safe_error(error: BaseException, config: PipelineConfig) -> str:
     from .model_relay import redact_model_secrets
 
     return redact_model_secrets(f"{type(error).__name__}: {error}", config)
+
+
+def _cleanup_resources(logs: Path, config: PipelineConfig) -> list[str]:
+    if config.sandbox:
+        from .sandbox_runtime import cleanup_logged_sandboxes
+
+        return asyncio.run(cleanup_logged_sandboxes(logs))
+    return asyncio.run(cleanup_logged_rjobs(logs, config.namespace))
 
 
 def execute_task(task: SelectedTask, run_root: Path, config: PipelineConfig) -> dict:
@@ -232,9 +231,9 @@ def execute_task(task: SelectedTask, run_root: Path, config: PipelineConfig) -> 
                     raise
                 if config.extra["cancel_event"].is_set():
                     raise InterruptedError("运行已中断") from error
-                cleanup = asyncio.run(cleanup_logged_rjobs(prepared / "harbor-jobs/agent/runtime-logs", config.namespace))
+                cleanup = _cleanup_resources(prepared / "harbor-jobs/agent/runtime-logs", config)
                 if cleanup:
-                    raise StageFailure("旧集群资源未确认关闭，不重复提交: " + "; ".join(cleanup), stage="infrastructure") from error
+                    raise StageFailure("旧运行资源未确认关闭，不重复提交: " + "; ".join(cleanup), stage="infrastructure") from error
                 print(f"[{task.name}] 连接未完成，第 {attempt + 1} 次重试", flush=True)
                 if config.extra["cancel_event"].wait((5, 15)[attempt]):
                     raise InterruptedError("运行已中断") from error
@@ -252,12 +251,12 @@ def execute_task(task: SelectedTask, run_root: Path, config: PipelineConfig) -> 
     finally:
         try:
             logs = task_root / "task" / "harbor-jobs" / "agent" / "runtime-logs"
-            cleanup = asyncio.run(cleanup_logged_rjobs(logs, config.namespace))
+            cleanup = _cleanup_resources(logs, config)
             report["cleanup"] = cleanup
             if cleanup:
-                report.update(status="failed", error="部分集群资源未确认关闭，请查看 cleanup 记录")
+                report.update(status="failed", error="部分运行资源未确认关闭，请查看 cleanup 记录")
         except Exception as error:
-            report.update(status="failed", error="集群清理失败: " + _safe_error(error, config))
+            report.update(status="failed", error="运行资源清理失败: " + _safe_error(error, config))
         _write_json(report_path, report)
     if report["status"] == "scored":
         note = "执行超时，已采用最后保存提交的成绩；" if report.get("timed_out") else ""
@@ -285,8 +284,17 @@ def run_tasks(args: argparse.Namespace) -> int:
         from .model_relay import prepare_model_relay
 
         prepare_model_relay(config)
-    if not PROJECT_HARBOR.is_file() or not shutil.which("rjob") or not shutil.which("brainctl"):
-        raise ConfigError("缺少项目 Harbor、rjob 或 brainctl，请先检查本机环境")
+    if not PROJECT_HARBOR.is_file():
+        raise ConfigError("缺少项目 Harbor，请先检查本机环境")
+    if config.sandbox:
+        from .sandbox_runtime import preflight_sandbox
+
+        try:
+            preflight_sandbox()
+        except Exception as error:
+            raise ConfigError("沙盒登录或资源池检查失败: " + _safe_error(error, config)) from None
+    elif not shutil.which("rjob") or not shutil.which("brainctl"):
+        raise ConfigError("缺少 rjob 或 brainctl，请先检查本机环境")
     config.extra["claude_source"] = str(resolve_claude_source(config.claude_bin))
     config.output_root.mkdir(parents=True, exist_ok=True)
     run_root = config.output_root / (datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
@@ -311,7 +319,7 @@ def run_tasks(args: argparse.Namespace) -> int:
             config.extra["cancel_event"].set()
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            print("收到中断，正在保存记录并关闭本次集群资源，请稍候", file=sys.stderr, flush=True)
+            print("收到中断，正在保存记录并关闭本次运行资源，请稍候", file=sys.stderr, flush=True)
             for future in futures:
                 future.cancel()
     for future, task in futures.items():

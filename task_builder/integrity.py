@@ -76,17 +76,20 @@ def resolve_data_path(pattern: str, data_root: Path) -> list[str]:
     """data_split 路径（可含通配符）在来源 data/ 中实际对应的相对路径，按字典序排列。"""
     matches: set[str] = set()
     for option in _expand_braces(pattern):
-        if not option:
+        if not option or Path(option).is_absolute() or ".." in Path(option).parts:
             continue
         if any(char in option for char in "*?["):
-            matches.update(path.relative_to(data_root).as_posix() for path in data_root.glob(option))
+            try:
+                matches.update(path.relative_to(data_root).as_posix() for path in data_root.glob(option))
+            except (ValueError, NotImplementedError):
+                continue
         elif (data_root / option).exists():
             matches.add(option)
     return sorted(matches)
 
 
 def _data_split_files(plan: dict) -> list:
-    split = plan.get("data_split")
+    split = plan.get("data_split") if isinstance(plan, dict) else None
     files = split.get("files") if isinstance(split, dict) else None
     return files if isinstance(files, list) else []
 
@@ -95,7 +98,7 @@ def withheld_data_paths(plan: dict, data_root: Path) -> tuple[str, ...]:
     """计划中标为 author_result / evaluation_reference 的来源数据路径（展开通配符）。"""
     paths: list[str] = []
     for item in _data_split_files(plan):
-        if not isinstance(item, dict) or item.get("role") == "solver_input":
+        if not isinstance(item, dict) or item.get("role") not in ("author_result", "evaluation_reference"):
             continue
         path = normalize_data_path(item.get("path", ""), data_root)
         if path:

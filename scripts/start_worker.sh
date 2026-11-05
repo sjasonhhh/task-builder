@@ -37,20 +37,25 @@ def main():
             "--private-machine=group", f"--image={args.image}", f"--mount={config.mount}",
             f"--volume={project}:{project}",
             f"--cpu={args.cpu}", f"--memory={args.memory_mb}", f"--requests.memory={args.memory_mb}",
-            f"--gpu={args.gpus}", "--workdir=/", "--enable-sshd=true", "--max-wait-duration=15m",
+            f"--gpu={args.gpus}", "--workdir=/", "--enable-sshd=true",
+            f"--priority={args.priority if args.priority is not None else config.priority}",
+            f"--max-wait-duration={args.wait_minutes}m",
             "--i-know-i-am-wasting-resource=true", "--comment=task-builder", "--detach",
             "--", "bash", "-c", 'export PATH="/kubebrain:$PATH"; exec sleep infinity',
         ]
         if args.dry_run:
             print(shlex.join(command))
             return 0
-        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1000)
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=args.wait_minutes * 60 + 120)
         print(result.stdout, end="", flush=True)
         if result.returncode:
             return result.returncode
         workers = re.findall(r"\bws-[A-Za-z0-9-]+-worker-[A-Za-z0-9-]+\b", result.stdout)
         name = workers[-1] if workers else "<启动结果中的worker名称>"
-        print("进入 worker：\n" + shlex.join([
+        print("申请已提交；这不代表容器已经开始运行。查看状态：\n" + shlex.join([
+            "brainctl", "get", f"--namespace={config.namespace}", f"process/{name}",
+        ]))
+        print("状态为 Running 后进入 worker：\n" + shlex.join([
             "brainctl", "exec", f"--namespace={config.namespace}", "-it", f"process/{name}", "--", "bash",
         ]))
         print("进入后执行：\nexport TB=" + shlex.quote(project) + '\ncd "$TB"')

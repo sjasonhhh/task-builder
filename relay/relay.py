@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
-from urllib.request import ProxyHandler, Request, build_opener, getproxies, proxy_bypass
+from urllib.request import ProxyHandler, Request, build_opener, getproxies, proxy_bypass, proxy_bypass_environment
 
 
 ROOT = Path(__file__).resolve().parent
@@ -108,6 +108,36 @@ def checked_url(value: str):
     return parsed
 
 
+def validate_proxy_config(config: dict) -> None:
+    value = config.get("upstream_proxy")
+    if value is not None:
+        if not isinstance(value, str) or not value.strip():
+            raise RelayError("upstream_proxy 必须为 HTTP/HTTPS 代理地址或 null")
+        parsed = checked_url(value)
+        if parsed.path not in {"", "/"}:
+            raise RelayError("upstream_proxy 不能包含路径")
+    bypass = config.get("upstream_no_proxy", [])
+    if not isinstance(bypass, list) or any(not isinstance(host, str) or not host.strip() for host in bypass):
+        raise RelayError("upstream_no_proxy 必须为主机名字符串数组")
+
+
+def upstream_proxy(upstream, config: dict):
+    if "upstream_proxy" in config:
+        # Explicit service configuration is independent of the launching shell,
+        # including inherited NO_PROXY. null explicitly selects direct access.
+        value = config["upstream_proxy"]
+        bypass = ",".join(config.get("upstream_no_proxy", []))
+        if value is None or proxy_bypass_environment(upstream.hostname, {"no": bypass}):
+            return None
+        return checked_url(value)
+    # Preserve legacy behavior for configurations without a network setting.
+    if proxy_bypass(upstream.hostname):
+        return None
+    proxies = getproxies()
+    value = proxies.get(upstream.scheme) or proxies.get("all")
+    return checked_url(value if "://" in value else "http://" + value) if value else None
+
+
 def detect_host() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
         try:
@@ -166,6 +196,7 @@ class Entry:
 
 def load_config(path: Path) -> tuple[dict, list[Entry]]:
     config = read_json(path)
+    validate_proxy_config(config)
     registrations = config.get("entries")
     if not isinstance(registrations, list) or not registrations:
         raise RelayError("config.json 必须登记至少一个 entries 入口")
@@ -216,7 +247,8 @@ def load_config(path: Path) -> tuple[dict, list[Entry]]:
 
 
 class APIService:
-    def __init__(self, entry: Entry, *, bind_host: str, advertised_host: str, service_id: str, timeout: int):
+    def __init__(self, entry: Entry, *, bind_host: str, advertised_host: str, service_id: str, timeout: int,
+                 proxy_config: dict | None = None):
         self.entry = entry
         self.token = secrets.token_urlsafe(32)
         self.service_id = service_id
@@ -226,11 +258,7 @@ class APIService:
         self.failures = 0
         self.lock = threading.Lock()
         self.upstream = checked_url(entry.upstream)
-        self.proxy = None
-        if not proxy_bypass(self.upstream.hostname):
-            value = getproxies().get(self.upstream.scheme) or getproxies().get("all")
-            if value:
-                self.proxy = checked_url(value if "://" in value else "http://" + value)
+        self.proxy = upstream_proxy(self.upstream, proxy_config or {})
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -525,7 +553,7 @@ def serve(config_path: Path, service_id: str) -> None:
         config, entries = load_config(config_path)
         advertised_host = config.get("advertised_host") or detect_host()
         for entry in entries:
-            services.append(APIService(entry, bind_host=config.get("bind_host", "0.0.0.0"), advertised_host=advertised_host, service_id=service_id, timeout=config.get("timeout_sec", 3900)))
+            services.append(APIService(entry, bind_host=config.get("bind_host", "0.0.0.0"), advertised_host=advertised_host, service_id=service_id, timeout=config.get("timeout_sec", 3900), proxy_config=config))
         for item in services:
             item.start()
         record = {"version": 1, "service_id": service_id, "host": host_identity(), "pid": os.getpid(), "process_start": process_start(os.getpid())}

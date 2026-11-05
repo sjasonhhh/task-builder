@@ -21,7 +21,7 @@
 
 按 rubric 的 task_security 与 task_toml_schema 生成全部必需文件。
 
-Planner 计划 {plan_path} 顶层恰好三个字段，按如下方式使用：
+读取 Planner 计划 {plan_path} 的全部内容，以下是常用字段的用途；计划可以包含额外说明或采用其他组织方式：
 - `problem`：生成 instruction.md 的背景、输入数据、任务、提交产物与评测方式；
 - `data_split`：草稿 data/ 初始为空，由你按 rubric 的 data_split 条目准备，它就是求解者看到的任务 data/。用 Bash（cp、mv、gzip、tar 等）把 `solver_input` 文件从 {data} 复制进草稿 data/，按需改名、去掉来源目录层级、拆分或做无损格式转换；每份数据只放一份，不放 `author_result` 与 `evaluation_reference`；instruction.md 中的输入路径与草稿 data/ 保持一致；
 - `verifier_metrics`：生成 tests/。tests/ 是一个评分器（grader）：按 metric_provenance 计算各指标，按 scoring 把指标值换算成 0–1 的连续总分写入 reward.txt，输出文件按 ctrf_reporting。非计分防作弊检查只能验证题面输出契约、客观数学/数据完整性，或论文/原始代码明确要求；不得加入无依据的经验阈值或参考方案行为限制。

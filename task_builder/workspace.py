@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import time
 import uuid
@@ -21,7 +20,6 @@ ENVIRONMENT_FILES = (
     "README.md",
     ENV_IMAGE_CONFIG_NAME,
 )
-_ENV_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 @dataclass(frozen=True)
@@ -51,20 +49,15 @@ def new_run_root(output_root: Path) -> Path:
 def complete_environments(root: Path) -> list[str]:
     if not root.is_dir():
         return []
-    return [path.name for path in sorted(root.iterdir()) if path.is_dir() and all((path / name).is_file() for name in ENVIRONMENT_FILES)]
+    return [path.name for path in sorted(root.iterdir()) if path.is_dir()]
 
 
 def resolve_environment_dir(name: str, root: Path = SCIENV_IMAGE_ROOT) -> Path:
-    """按 --sci-env 取共享环境目录 root/<name>/，并校验必需文件齐全。"""
-    if not _ENV_NAME.fullmatch(name or ""):
-        raise ValueError(f"--sci-env 只能包含字母、数字、点、下划线和连字符，且不能以符号开头: {name!r}")
+    """按 --sci-env 取共享环境目录 root/<name>/，读取已有材料。"""
     available = "、".join(complete_environments(root)) or "无"
     directory = root / name
     if not directory.is_dir():
         raise ValueError(f"共享环境目录不存在: {directory}；{root} 下可用的环境: {available}")
-    missing = [file for file in ENVIRONMENT_FILES if not (directory / file).is_file()]
-    if missing:
-        raise ValueError(f"共享环境 {directory} 缺少文件: {', '.join(missing)}；{root} 下可用的环境: {available}")
     return directory
 
 
@@ -81,10 +74,13 @@ def create_shared_workspace(run_root: Path, config: PipelineConfig) -> Path:
         # 镜像配置复制本次实际生效的那一份（可能由 --image-env 覆盖）。
         source_path = Path(config.image_env_path) if name == ENV_IMAGE_CONFIG_NAME else environment_source / name
         if not source_path.is_file():
-            raise FileNotFoundError(f"共享环境文件不存在: {source_path}")
+            continue
         shutil.copy2(source_path, environment_target / name)
     # shared 中只包含当前生效的规则文件。
     shutil.copy2(config.rubric_path, shared_dir / ("rubric" + Path(config.rubric_path).suffix))
+    advice = environment_source / "human_advise.md"
+    if advice.is_file():
+        shutil.copy2(advice, shared_dir / "human_advise.md")
     return shared_dir
 
 
@@ -101,9 +97,11 @@ def create_source_workspace(run_root: Path, shared_dir: Path, source: SourceBund
     logs_dir = source_root / "logs"
     for path in (input_dir, plan_dir, draft_dir, reviewer_dir, validation_dir, failures_dir, logs_dir):
         path.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source.context, input_dir / "context", dirs_exist_ok=True)
-    shutil.copytree(source.data, input_dir / "data", dirs_exist_ok=True)
-    shutil.copytree(source.code, input_dir / "code", dirs_exist_ok=True)
+    for name in ("context", "data", "code"):
+        source_dir = getattr(source, name)
+        (input_dir / name).mkdir(exist_ok=True)
+        if source_dir.is_dir():
+            shutil.copytree(source_dir, input_dir / name, dirs_exist_ok=True)
     return SourceWorkspace(
         run_root=run_root,
         workspace_root=workspace_root,
@@ -135,10 +133,6 @@ def directory_manifest(root: Path) -> dict[str, tuple[str, str]]:
         elif path.is_dir():
             manifest[relative] = ("directory", "")
     return manifest
-
-
-def directories_unchanged(baselines: dict[Path, dict[str, tuple[str, str]]]) -> bool:
-    return all(directory_manifest(root) == baseline for root, baseline in baselines.items())
 
 
 def record_event(workspace: SourceWorkspace, event: str, **data: object) -> None:

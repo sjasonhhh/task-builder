@@ -74,6 +74,8 @@ class PipelineConfig:
     local_only: bool = False
     model_relay: Path | None = None
     run_txt: Path | None = None
+    human_review: bool = False
+    sandbox: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
 

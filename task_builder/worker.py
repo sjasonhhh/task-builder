@@ -29,6 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpu", type=_positive_int, default=16)
     parser.add_argument("--memory-mb", type=_positive_int, default=65536)
     parser.add_argument("--gpus", type=_positive_int, default=1)
+    parser.add_argument("--priority", type=int, choices=range(1, 10), help="排队优先级；默认使用 image-env.toml 中的 priority")
+    parser.add_argument("--wait-minutes", type=_positive_int, default=60, help="等待集群分配机器的分钟数，默认 60")
     parser.add_argument("--dry-run", action="store_true", help="显示启动命令，不申请集群资源")
     return parser
 
@@ -50,7 +52,9 @@ def launch_command(args: argparse.Namespace, project_root: Path = PROJECT_ROOT) 
         "rlaunch", f"--namespace={config.namespace}", f"--charged-group={config.charged_group}",
         "--private-machine=group", f"--image={args.image}", f"--mount={config.mount}",
         f"--cpu={args.cpu}", f"--memory={args.memory_mb}", f"--requests.memory={args.memory_mb}",
-        f"--gpu={args.gpus}", f"--workdir={root}", "--enable-sshd=true", "--max-wait-duration=15m",
+        f"--gpu={args.gpus}", f"--workdir={root}", "--enable-sshd=true",
+        f"--priority={args.priority if args.priority is not None else config.priority}",
+        f"--max-wait-duration={args.wait_minutes}m",
         "--i-know-i-am-wasting-resource=true", "--comment=task-builder", "--detach",
         "--", "bash", "-c", 'export PATH="/kubebrain:$PATH"; exec sleep infinity',
     ]
@@ -64,13 +68,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             print(shlex.join(command))
             return 0
-        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1000)
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=args.wait_minutes * 60 + 120)
         print(result.stdout, end="", flush=True)
         if result.returncode:
             return result.returncode
         workers = re.findall(r"\bws-[A-Za-z0-9-]+-worker-[A-Za-z0-9-]+\b", result.stdout)
         name = workers[-1] if workers else "<启动结果中的worker名称>"
-        print("进入 worker：\n" + shlex.join(["brainctl", "exec", f"--namespace={namespace}", "-it", f"process/{name}", "--", "bash"]))
+        print("申请已提交；这不代表容器已经开始运行。查看状态：\n" + shlex.join(["brainctl", "get", f"--namespace={namespace}", f"process/{name}"]))
+        print("状态为 Running 后进入 worker：\n" + shlex.join(["brainctl", "exec", f"--namespace={namespace}", "-it", f"process/{name}", "--", "bash"]))
         return 0
     except subprocess.TimeoutExpired:
         print("启动等待超时，请在集群中检查本次 task-builder worker 是否已启动。", file=sys.stderr)

@@ -1,6 +1,8 @@
 {
   "bind_host": "0.0.0.0",
   "advertised_host": null,
+  "upstream_proxy": null,
+  "upstream_no_proxy": ["localhost", "127.0.0.1", "::1"],
   "entries": [
     {
       "name": "author",

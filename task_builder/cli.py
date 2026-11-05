@@ -25,6 +25,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, help="输出根目录；实际写入 <output>/<sci-env>/")
     parser.add_argument("--resume-from", help="复用旧运行目录的计划和草稿；不改旧目录")
     parser.add_argument("--local-only", action="store_true", help="仅恢复与本地检查，不调用模型、不连接集群、不发布")
+    parser.add_argument("--human-review", action="store_true", help="生成人工审核标记；名单中标为需要修改的成品直接进入修复")
+    parser.add_argument("--sandbox", action="store_true", help="通过通算沙盒运行 CPU 实验和评分；读取 config/sandbox.env")
     parser.add_argument("--author-env", required=True, help="作者、审查和造任务模型配置")
     parser.add_argument("--model-relay", help="通用反代连接文件；启动前检查原开发机服务")
     parser.add_argument("--run-txt", "--run_txt", dest="run_txt", help="每行一个来源名（<input>/<sci-env>/ 下的目录名），只运行名单中尚未发布的任务")

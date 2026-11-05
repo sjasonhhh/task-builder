@@ -85,7 +85,7 @@ def _toml_int(table: dict, key: str, section: str, path: Path) -> int:
     return value
 
 
-def load_image_env(path: str | Path) -> ImageEnvConfig:
+def load_image_env(path: str | Path, *, sandbox: bool = False) -> ImageEnvConfig:
     image_env_path = Path(path).expanduser().resolve()
     if not image_env_path.is_file():
         raise ConfigError(f"image-env 文件不存在: {image_env_path}")
@@ -94,14 +94,17 @@ def load_image_env(path: str | Path) -> ImageEnvConfig:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"image-env 不是有效 TOML: {image_env_path}: {exc}") from exc
     images = _toml_table(document, "images", image_env_path)
-    hcluster = _toml_table(document, "hcluster", image_env_path)
+    hcluster = document.get("hcluster", {}) if sandbox else _toml_table(document, "hcluster", image_env_path)
+    if sandbox:
+        hcluster = {"max_cpu": 4, "max_memory_mb": 8192, "max_agent_gpus": 0,
+                    "max_verifier_gpus": 0, "priority": 9, **hcluster}
     timeouts = _toml_table(document, "timeouts", image_env_path)
     return ImageEnvConfig(
         experiment_image=_toml_string(images, "experiment", "images", image_env_path),
         evaluation_image=_toml_string(images, "evaluation", "images", image_env_path),
-        charged_group=_toml_string(hcluster, "charged_group", "hcluster", image_env_path),
-        mount=_toml_string(hcluster, "mount", "hcluster", image_env_path),
-        namespace=_toml_string(hcluster, "namespace", "hcluster", image_env_path),
+        charged_group="" if sandbox else _toml_string(hcluster, "charged_group", "hcluster", image_env_path),
+        mount="" if sandbox else _toml_string(hcluster, "mount", "hcluster", image_env_path),
+        namespace="" if sandbox else _toml_string(hcluster, "namespace", "hcluster", image_env_path),
         cpu=_toml_int(hcluster, "max_cpu", "hcluster", image_env_path),
         memory_mb=_toml_int(hcluster, "max_memory_mb", "hcluster", image_env_path),
         agent_gpus=_toml_int(hcluster, "max_agent_gpus", "hcluster", image_env_path),
@@ -172,9 +175,17 @@ def build_config(
     local_only: bool = False,
     model_relay: str | Path | None = None,
     run_txt: str | Path | None = None,
+    human_review: bool = False,
+    sandbox: bool = False,
 ) -> PipelineConfig:
+    if human_review and local_only:
+        raise ConfigError("--human-review 不能与 --local-only 同时使用")
     environment_dir, image_env_path = resolve_environment(sci_env, image_env, Path(environment_root or SCIENV_IMAGE_ROOT))
-    image_values = load_image_env(image_env_path)
+    image_values = load_image_env(image_env_path, sandbox=sandbox)
+    if sandbox and not local_only:
+        from .sandbox_runtime import sandbox_settings
+
+        sandbox_settings()
     experiment_image = experiment_image if experiment_image is not None else image_values.experiment_image
     evaluation_image = evaluation_image if evaluation_image is not None else image_values.evaluation_image
     charged_group = charged_group if charged_group is not None else image_values.charged_group
@@ -243,15 +254,26 @@ def build_config(
         local_only=local_only,
         model_relay=Path(model_relay).expanduser().absolute() if model_relay else None,
         run_txt=_existing_file(run_txt, "任务名单") if run_txt else None,
+        human_review=human_review,
+        sandbox=sandbox,
     )
 
 
 def environment_for_subprocess(config: EnvConfig, *, model_id: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
+    if env.get("TASK_BUILDER_DIRECT_MODELS") == "1":
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            env.pop(key, None)
     if config.values.get("TASK_BUILDER_MODEL_RELAY_ACTIVE") == "1":
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
             env.pop(key, None)
     env.update(config.values)
+    # Sandbox AD credentials belong to the controller, not author/reviewer agents.
+    for key in ("AD_USERNAME", "AD_PASSWORD", "OPEN_SANDBOX_GATEWAY_TOKEN", "TASK_BUILDER_SANDBOX_CONFIG"):
+        env.pop(key, None)
+    if os.environ.get("TASK_BUILDER_DIRECT_MODELS") == "1":
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            env.pop(key, None)
     env["ANTHROPIC_MODEL"] = model_id or config.model_id
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
     if not env.get("ANTHROPIC_API_KEY") and env.get("ANTHROPIC_AUTH_TOKEN"):

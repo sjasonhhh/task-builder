@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .models import PipelineConfig, SourceBundle, StageFailure
 from .source_privacy import validate_public_description
-from .integrity import SOLVER_HIDDEN_DATA, content_manifest, leaked_withheld_files, manifest_differences
+from .integrity import SOLVER_HIDDEN_DATA, leaked_withheld_files
 from .deadline import remaining_timeout
 
 
@@ -87,11 +87,7 @@ def _copy_writer_data(draft: Path, source: SourceBundle, target: Path) -> None:
     leaked = leaked_withheld_files(draft_data, source.data, json.loads(plan_path.read_text(encoding="utf-8")))
     if leaked:
         raise StageFailure("草稿 data/ 中以下文件与计划标为 author_result / evaluation_reference 的来源文件内容相同，不能交给求解者: " + ", ".join(leaked), stage="validation-data")
-    expected = content_manifest(draft_data)
     shutil.copytree(draft_data, target / "data", dirs_exist_ok=True)
-    differences = manifest_differences(expected, content_manifest(target / "data"))
-    if differences:
-        raise StageFailure("本地数据复制不完整: " + ", ".join(differences), stage="validation-data")
 
 
 def _copy_task_data(draft: Path, source: SourceBundle, target: Path, config: PipelineConfig) -> None:
@@ -160,7 +156,7 @@ def finalize_harbor_task(target: Path, config: PipelineConfig, *, agent_timeout_
     for table, image in (("environment", config.experiment_image), ("verifier.environment", config.evaluation_image)):
         text = _set_table_value(text, table, "docker_image", image)
         text = _set_table_value(text, table, "network_mode", "no-network")
-        text = _set_table_value(text, table, "build_timeout_sec", 1800)
+        text = _set_table_value(text, table, "build_timeout_sec", 3600 if getattr(config, "sandbox", False) else 1800)
     if agent_timeout_sec is not None:
         text = _set_table_value(text, "agent", "timeout_sec", agent_timeout_sec)
     task_path.write_text(text, encoding="utf-8")

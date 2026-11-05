@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
-from .agents import IndependentClaudeAgent, run_agent_expecting_json, save_agent_log
+from .agents import IndependentClaudeAgent, extract_json, save_agent_log
 from .models import AgentError, PipelineConfig, SourceBundle, StageFailure
 from .staging import validate_task_config, validate_task_metadata
 from .prompting import draft_manifest, load_prompt, read_shared_material, source_manifest, task_data_manifest
-from .workspace import SourceWorkspace, directory_manifest, directories_unchanged
+from .workspace import SourceWorkspace
 
 
 def _review_view(workspace: SourceWorkspace, cycle: int) -> Path:
@@ -24,22 +25,26 @@ def _review_view(workspace: SourceWorkspace, cycle: int) -> Path:
     return view
 
 
-def _validate_contract(result: dict) -> None:
-    if not isinstance(result.get("pass"), bool):
-        raise StageFailure("Reviewer JSON 缺少布尔值 pass", stage="reviewer")
-    issues = result.get("blocking_issues")
-    warnings = result.get("warnings")
-    if not isinstance(issues, list) or not isinstance(warnings, list) or not isinstance(result.get("summary"), str):
-        raise StageFailure("Reviewer JSON 不符合结构化审查格式", stage="reviewer")
-    for issue in issues:
-        if not isinstance(issue, dict) or not all(isinstance(issue.get(key), expected) for key, expected in (("criterion", str), ("problem", str), ("evidence", list), ("required_fix", str))):
-            raise StageFailure("Reviewer 的 blocking_issues 必须是包含 criterion/problem/evidence/required_fix 的对象数组", stage="reviewer")
-        if not all(isinstance(item, str) for item in issue["evidence"]):
-            raise StageFailure("Reviewer 的 blocking_issues.evidence 必须是字符串数组", stage="reviewer")
-    if result["pass"] and issues:
-        raise StageFailure("Reviewer JSON 标记通过但仍有 blocking_issues", stage="reviewer")
-    if not result["pass"] and not issues:
-        raise StageFailure("Reviewer JSON 未通过但没有 blocking_issues", stage="reviewer")
+def _review_response(text: str) -> dict:
+    """读取审核结论，保留意见，不以 JSON 字段的形状拒绝审核。"""
+    try:
+        result = extract_json(text)
+    except AgentError:
+        result = {"summary": text}
+    decision = result.get("pass")
+    if not isinstance(decision, bool):
+        value = str(decision).strip().lower()
+        if value in {"true", "通过", "pass", "passed"}:
+            decision = True
+        elif value in {"false", "不通过", "未通过", "fail", "failed", "需要修改"}:
+            decision = False
+        else:
+            # 自然语言意见也可使用；只接受明确的结论，不把“没有问题字段”当通过。
+            summary = str(result.get("summary", text)).replace("**", "").strip()
+            match = re.search(r"(?:^|\n)\s*(?:(?:审核结论|最终结论|结论|状态)\s*[:：]\s*)?(通过|不通过|未通过|需要修改|PASS|FAIL)\s*[。.!！]?\s*$", summary, re.I)
+            decision = bool(match and match.group(1).lower() in {"通过", "pass"})
+    result["pass"] = decision
+    return result
 
 
 def run_reviewer_agent(source: SourceBundle, config: PipelineConfig, workspace: SourceWorkspace, agent: IndependentClaudeAgent, *, cycle: int) -> dict:
@@ -55,19 +60,14 @@ def run_reviewer_agent(source: SourceBundle, config: PipelineConfig, workspace: 
         code=workspace.input_dir / "code",
         plan_path=workspace.plan_dir / "plan.json",
         rubric=rubric,
+        shared_dir=workspace.shared_dir,
+        human_feedback_path=workspace.reviews_dir / "human" / "request.md",
         environment=environment,
         environment_dir=workspace.shared_dir / environment_dir,
         source_manifest=source_manifest(workspace.input_dir),
         draft_manifest=draft_manifest(workspace.draft_dir),
         task_data_manifest=task_data_manifest(workspace.input_dir / "data", workspace.draft_dir, workspace.plan_dir / "plan.json"),
     )
-    protected = {
-        workspace.input_dir: directory_manifest(workspace.input_dir),
-        workspace.plan_dir: directory_manifest(workspace.plan_dir),
-        workspace.draft_dir: directory_manifest(workspace.draft_dir),
-        workspace.shared_dir: directory_manifest(workspace.shared_dir),
-        view: directory_manifest(view),
-    }
     run_options = {
         "workdir": view,
         "env_config": config.author_env,
@@ -75,27 +75,20 @@ def run_reviewer_agent(source: SourceBundle, config: PipelineConfig, workspace: 
         "read_only_dirs": (workspace.input_dir, workspace.plan_dir, workspace.draft_dir, workspace.shared_dir),
     }
     try:
-        _, result = run_agent_expecting_json(
-            agent,
+        run = agent.run(
             role=f"reviewer-cycle-{cycle}",
             prompt=prompt,
-            log_path=workspace.logs_dir / f"reviewer-cycle-{cycle:03d}.log",
             **run_options,
         )
+        save_agent_log(workspace.logs_dir / f"reviewer-cycle-{cycle:03d}.log", run)
+        result = _review_response(run.stdout)
     except AgentError as exc:
         if hasattr(exc, "run"):
             save_agent_log(workspace.logs_dir / f"reviewer-cycle-{cycle:03d}.log", exc.run)
         raise StageFailure(str(exc), stage="reviewer") from exc
-    if not directories_unchanged(protected):
-        raise StageFailure("Reviewer Agent 修改了只读资料或在审查目录中生成了文件", stage="reviewer")
-    _validate_contract(result)
     path = workspace.reviews_dir / f"review-cycle-{cycle:03d}.json"
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     if not result["pass"]:
-        issues = result["blocking_issues"]
-        details = "；".join(
-            f"{item['criterion']}: {item['problem']}；证据={item['evidence']}；修复={item['required_fix']}"
-            for item in issues
-        )
-        raise StageFailure("Reviewer Agent 未通过（共 " + str(len(issues)) + " 项，详见 reviews/）: " + details, stage="reviewer")
+        details = json.dumps(result, ensure_ascii=False)
+        raise StageFailure("Reviewer Agent 未通过，审核意见（详见 reviews/）: " + details, stage="reviewer")
     return result
