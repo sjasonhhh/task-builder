@@ -214,24 +214,7 @@ bash "$TB/run.sh" \
   --task-timeout-sec 19800
 ```
 
-### 6. 答题与评分
-
-在 `config/run-task.txt` 中填写 `output/<领域>/final/` 下的任务目录名，每行一个。
-
-在 worker 内执行：
-
-```bash
-bash "$TB/run_task.sh" \
-  --sci-env "$SCI_ENV" \
-  --input "$TB/output/$SCI_ENV/final" \
-  --output "$TB/output/agent-runs/$SCI_ENV" \
-  --run_txt "$TB/config/run-task.txt" \
-  --env "$TB/config/author.env" \
-  --model-relay "$TB/relay/connection.json" \
-  --concurrency 1
-```
-
-### 7. 结束运行
+### 6. 结束运行
 
 退出 worker：
 
@@ -305,24 +288,111 @@ bash "$TB/run_sandbox.sh" \
   --task-timeout-sec 19800
 ```
 
-### 4. 答题与评分
+造题结果完整回传后，程序自动清理对应沙盒。
 
-在 `config/run-task.txt` 中填写 `output/<领域>/final/` 下的任务目录名，每行一个。执行这条命令的开发机需要安装 Claude Code。
+## 四、运行已有任务并评分
+
+### 1. 共用准备
+
+运行机器需要 Python 3.12+、Git LFS、`patch` 和 Claude Code。
 
 ```bash
+export TB="/你的共享目录/task-builder"
+export SCI_ENV="test_env"
+
+cd "$TB"
+git lfs pull --include="output/$SCI_ENV/final/**" --exclude=""
+bash "$TB/setup_env.sh"
+cp -n "$TB/config/author.env.example" "$TB/config/author.env"
+```
+
+填写运行配置：
+
+| 文件 | 内容 |
+|---|---|
+| `config/author.env` | 模型名称、接口地址、密钥 |
+| `image/test_env/image-env.toml` | 实验镜像、评测镜像和资源上限；H 集群还需填写自己的命名空间、配额组和共享目录 |
+| `config/run-task.txt` | 要运行的任务目录名，每行一个 |
+
+任务名单示例，删除不需要运行的任务：
+
+```bash
+cat > "$TB/config/run-task.txt" <<'EOF'
+cell2location-spot-spot-visium-spot-nature
+cellbender-remove-background
+decontx
+demuxlet-doublet-detection
+genomedca-epistasis
+hatchet-copy-number-wgd
+pyseer-bacterial-gwas
+pyseer-elastic-net-gwas
+EOF
+```
+
+### 2. H 集群模式
+
+在可访问模型接口的开发机上，准备并填写 `relay/config.json`。开发机与 worker 使用相同项目路径。
+
+```bash
+cp -n "$TB/relay/config.example.json" "$TB/relay/config.json"
+```
+
+启动模型转发：
+
+```bash
+python3 "$TB/relay/relay.py" start
+```
+
+在已准备好的 H 集群 worker 中执行共用准备，再运行：
+
+```bash
+export PATH="/kubebrain:$PATH"
+
 bash "$TB/run_task.sh" \
   --sci-env "$SCI_ENV" \
   --input "$TB/output/$SCI_ENV/final" \
-  --output "$TB/output/agent-runs/$SCI_ENV" \
+  --output "$TB/output/agent-runs/$SCI_ENV/hcluster" \
   --run_txt "$TB/config/run-task.txt" \
   --env "$TB/config/author.env" \
-  --concurrency 1 \
-  --sandbox
+  --image-env "$TB/image/$SCI_ENV/image-env.toml" \
+  --model-relay "$TB/relay/connection.json" \
+  --concurrency 1
 ```
 
-造题结果完整回传后，程序自动清理对应沙盒。
+### 3. Sandbox 模式
 
-## 四、人工审核与修改
+在开发机执行。需要沙盒平台账号和资源池权限，模型接口需能从沙盒直接访问；当前支持 CPU 任务。
+
+```bash
+cp -n "$TB/config/sandbox.env.example" "$TB/config/sandbox.env"
+```
+
+填写 `config/sandbox.env`：
+
+```dotenv
+BASE_URL=<沙盒平台HTTP或HTTPS地址>
+TASK_BUILDER_SANDBOX_RESOURCE=<资源池标识>
+AD_USERNAME=<你的AD账号>
+AD_PASSWORD='<你的AD密码>'
+```
+
+运行任务：
+
+```bash
+bash "$TB/run_task.sh" \
+  --sandbox \
+  --sci-env "$SCI_ENV" \
+  --input "$TB/output/$SCI_ENV/final" \
+  --output "$TB/output/agent-runs/$SCI_ENV/sandbox" \
+  --run_txt "$TB/config/run-task.txt" \
+  --env "$TB/config/author.env" \
+  --image-env "$TB/image/$SCI_ENV/image-env.toml" \
+  --concurrency 1
+```
+
+两种模式的结果分别保存在 `output/agent-runs/test_env/hcluster/` 和 `output/agent-runs/test_env/sandbox/`。
+
+## 五、人工审核与修改
 
 生成命令中的 `--human-review` 会为成品任务生成审核文件：
 
@@ -344,7 +414,7 @@ output/<领域>/final/<任务目录名>/human_review.md
 
 将对应论文保留在 `config/run.txt` 中，再执行原运行方式的生成命令。程序会读取修改意见并修复已有任务。
 
-## 五、输出位置
+## 六、输出位置
 
 ```text
 output/
@@ -355,8 +425,10 @@ output/
 │       └── <运行编号>/
 └── agent-runs/
     └── <领域>/
-        └── <运行编号>/
-            └── summary.json
+        ├── hcluster/
+        │   └── <运行编号>/summary.json
+        └── sandbox/
+            └── <运行编号>/summary.json
 ```
 
 - `final/`：生成的任务。
