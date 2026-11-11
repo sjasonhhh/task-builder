@@ -1,0 +1,17 @@
+[images]
+experiment = "<实验镜像地址>"
+evaluation = "<评分镜像地址>"
+
+[hcluster]
+namespace = "<集群命名空间>"
+charged_group = "<计费资源组>"
+mount = "gpfs://gpfs1/<共享存储名称>:<开发机上的共享存储绝对路径>"
+max_cpu = 16
+max_memory_mb = 65536
+max_agent_gpus = 1
+max_verifier_gpus = 1
+priority = 9
+
+[timeouts]
+agent_timeout_sec = 36000
+harbor_timeout_sec = 36000

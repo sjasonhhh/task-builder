@@ -57,3 +57,14 @@ __pycache__/
 !/image/chemistry/requirements-*.txt
 !/image/chemistry/image-env.toml.example
 !/image/chemistry/README.md
+
+# Published test_env image definitions.
+!/image/test_env/
+!/image/test_env/Dockerfile.evaluation
+!/image/test_env/Dockerfile.experiment
+!/image/test_env/README.md
+!/image/test_env/human_advise.md
+!/image/test_env/image-env.toml
+!/image/test_env/image-env.toml.example
+!/image/test_env/requirements-evaluation.txt
+!/image/test_env/requirements-experiment.txt
