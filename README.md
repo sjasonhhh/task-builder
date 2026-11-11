@@ -294,48 +294,46 @@ bash "$TB/run_sandbox.sh" \
 
 ### 1. 共用准备
 
-运行机器需要 Python 3.12+、Git LFS、`patch` 和 Claude Code。
+运行前，请先从[飞书页面](https://aicarrier.feishu.cn/wiki/T5fpw1UiLinWLfkpkeXczBnBn8b#share-MIQbdUQc2omG2WxXEVdc5qTXnKh)下载任务包，解压到 `output/test_env/final/`。目录名是 `final`，没有 s。每个任务目录内应有 `task.toml`、`instruction.md`、`data/`、`solution/` 和 `tests/`。
+
+```text
+output/test_env/final/
+├── decontx/
+├── cellbender-remove-background/
+├── demuxlet-doublet-detection/
+└── hatchet-copy-number-wgd/
+```
+
+运行机器需要 Python 3.12+、`patch` 和 Claude Code。
 
 ```bash
 export TB="/你的共享目录/task-builder"
 export SCI_ENV="test_env"
 
 cd "$TB"
-git lfs pull --include="output/$SCI_ENV/final/**" --exclude=""
 bash "$TB/setup_env.sh"
-cp -n "$TB/config/author.env.example" "$TB/config/author.env"
 ```
 
-填写运行配置：
+请创建或编辑以下配置文件，填写实际参数：
 
-| 文件 | 内容 |
+| 文件 | 需要填写 |
 |---|---|
-| `config/author.env` | 模型名称、接口地址、密钥 |
+| `config/author.env` | `MODEL_ID`：模型名称；`ANTHROPIC_BASE_URL`：模型接口地址；`ANTHROPIC_AUTH_TOKEN`：接口密钥 |
 | `image/test_env/image-env.toml` | 实验镜像、评测镜像和资源上限；H 集群还需填写自己的命名空间、配额组和共享目录 |
 | `config/run-task.txt` | 要运行的任务目录名，每行一个 |
 
-任务名单示例，删除不需要运行的任务：
+当前交付的四个任务，`config/run-task.txt` 填写：
 
-```bash
-cat > "$TB/config/run-task.txt" <<'EOF'
-cell2location-spot-spot-visium-spot-nature
-cellbender-remove-background
+```text
 decontx
+cellbender-remove-background
 demuxlet-doublet-detection
-genomedca-epistasis
 hatchet-copy-number-wgd
-pyseer-bacterial-gwas
-pyseer-elastic-net-gwas
-EOF
 ```
 
 ### 2. H 集群模式
 
-在可访问模型接口的开发机上，准备并填写 `relay/config.json`。开发机与 worker 使用相同项目路径。
-
-```bash
-cp -n "$TB/relay/config.example.json" "$TB/relay/config.json"
-```
+在可访问模型接口的开发机上，创建或编辑 `relay/config.json`：填写运行节点能够访问的开发机地址，模型配置文件指向 `config/author.env`；需要通过代理访问模型接口时，再填写代理地址。开发机与 worker（运行节点）使用相同项目路径。
 
 启动模型转发：
 
@@ -363,11 +361,7 @@ bash "$TB/run_task.sh" \
 
 在开发机执行。需要沙盒平台账号和资源池权限，模型接口需能从沙盒直接访问；当前支持 CPU 任务。
 
-```bash
-cp -n "$TB/config/sandbox.env.example" "$TB/config/sandbox.env"
-```
-
-填写 `config/sandbox.env`：
+请创建或编辑 `config/sandbox.env`，填写：
 
 ```dotenv
 BASE_URL=<沙盒平台HTTP或HTTPS地址>
