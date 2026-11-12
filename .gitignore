@@ -68,3 +68,6 @@ __pycache__/
 !/image/test_env/image-env.toml.example
 !/image/test_env/requirements-evaluation.txt
 !/image/test_env/requirements-experiment.txt
+
+# Dataset files stay outside the source repository.
+/inputs/single-cell/paper-001/data/
