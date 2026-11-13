@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .sandbox_runtime import (LIFETIME_MINUTES, RENEW_INTERVAL, STARTUP_TIMEOUT,
-                              SandboxClient, SandboxError)
+                              SandboxClient, SandboxError, create_was_rejected)
 from .sandbox_transfer import checked
 
 
@@ -61,19 +61,44 @@ class AuthoringSandbox:
             "lifecycleMinutes": LIFETIME_MINUTES, "networkPolicy": {"defaultAction": "allow", "egress": []},
         }
         self.save(phase="creating")
+        print(f"{self.state['source']}：正在申请造任务沙盒 {self.name}，"
+              f"CPU {self.state['cpu']}，内存 {self.state['memory_mb']} MiB", flush=True)
         try:
             result = self.client.json("POST", "/api/v1/sandboxes", payload, timeout=1800, retry=False, deadline=end)
         except SandboxError as exc:
-            if exc.status is not None and 400 <= exc.status < 500 and exc.status not in {408, 429}:
+            message = str(exc)
+            for key in ("_password", "_username", "_token"):
+                secret = getattr(self.client, key, "")
+                if secret:
+                    message = message.replace(secret, "<redacted>")
+            message = message[:1000]
+            self.save(create_error=message, create_error_status=exc.status)
+            print(f"{self.state['source']}：造任务沙盒创建请求异常：{message}；记录在 {self.path}", flush=True)
+            if create_was_rejected(exc):
+                self.save(phase="create-failed")
                 raise
             self.save(phase="create-uncertain")
+            print(f"{self.state['source']}：正在按名称 {self.name} 查询创建结果，未重复申请。", flush=True)
+            recovery_started = time.monotonic()
+            notice, attempts = 0, 0
             while time.monotonic() < end:
+                self.check()
                 found = self.client.find_created(self.name, end)
+                attempts += 1
+                self.save(create_lookup_attempts=attempts, create_matches=len(found),
+                          last_create_lookup_at=datetime.now(timezone.utc).isoformat())
                 if len(found) == 1:
                     result = found[0]
+                    print(f"{self.state['source']}：已找到本次创建的沙盒，继续等待启动。", flush=True)
                     break
                 if len(found) > 1:
                     raise SandboxError("创建结果不唯一，请按本轮记录中的名称检查；未重复创建")
+                now = time.monotonic()
+                if now - notice >= 60:
+                    print(f"{self.state['source']}：尚未查到本次沙盒，"
+                          f"已查询 {attempts} 次、等待 {int(now - recovery_started)} 秒；"
+                          f"首次创建错误：{message}", flush=True)
+                    notice = now
                 if self.cancelled.wait(10):
                     raise SandboxError("创建已中断，实例状态尚未确认；请按本轮记录中的名称检查")
             else:

@@ -48,6 +48,14 @@ class SandboxError(RuntimeError):
         self.status = status
 
 
+def create_was_rejected(error: SandboxError) -> bool:
+    """A quota denial confirms rejection; a generic 429 may be ambiguous."""
+    if error.status is None:
+        return False
+    return (400 <= error.status < 500 and error.status not in {408, 429}
+            or error.status == 429 and "配额不足" in str(error))
+
+
 def sandbox_settings() -> dict[str, str]:
     path = Path(os.environ.get("TASK_BUILDER_SANDBOX_CONFIG", str(PROJECT_CONFIG / "sandbox.env")))
     values = read_env_file(path) if path.is_file() else {}
@@ -393,7 +401,7 @@ class TaskBuilderSandboxEnvironment(BaseEnvironment):
         try:
             result = self._client.json("POST", "/api/v1/sandboxes", payload, timeout=1800, retry=False, deadline=end)
         except SandboxError as exc:
-            if exc.status is not None and 400 <= exc.status < 500 and exc.status not in {408, 429}:
+            if create_was_rejected(exc):
                 self._event("create-rejected", status=exc.status)
                 raise
             self._event("create-uncertain")

@@ -427,3 +427,125 @@ def test_status_poll_survives_one_502_without_relaunch(monkeypatch):
     assert requests[0].data == requests[1].data
     assert all(request.full_url.endswith("/command") for request in requests)
     assert b"launch.sh" not in requests[0].data
+
+
+def test_uncertain_author_create_redacts_error_and_recovers_without_resubmit(config, tmp_path, monkeypatch, capsys):
+    class Client:
+        base_url, resource = "http://platform", "pool"
+        _username, _password, _token = "ad-user", "ad-secret", "jwt-secret"
+
+        def __init__(self):
+            self.posts = 0
+            self.lookups = 0
+            self.deleted = []
+
+        def json(self, method, path, *args, **kwargs):
+            assert (method, path) == ("POST", "/api/v1/sandboxes")
+            self.posts += 1
+            raise SandboxError("HTTP 503 ad-user ad-secret jwt-secret", 503)
+
+        def find_created(self, name, deadline):
+            self.lookups += 1
+            return [{"id": "recovered-main"}]
+
+        def detail(self, sid, **kwargs):
+            return {"state": "Running"}
+
+        def command(self, sid, command, **kwargs):
+            return SimpleNamespace(return_code=0, stdout="")
+
+        def children(self, sid):
+            return []
+
+        def delete(self, sid):
+            self.deleted.append(sid)
+
+    client = Client()
+    monkeypatch.setattr("task_builder.sandbox_session.SandboxClient", lambda: client)
+    session = AuthoringSandbox(config, tmp_path / "run", "paper", threading.Event())
+    try:
+        session.start()
+        assert session.id == "recovered-main"
+        assert client.posts == client.lookups == 1
+        saved = json.loads(session.path.read_text())
+        assert saved["create_error_status"] == 503
+        assert saved["create_matches"] == 1
+        assert saved["phase"] == "running"
+        observed = capsys.readouterr().out + session.path.read_text()
+        assert "HTTP 503" in observed
+        assert all(value not in observed for value in (client._username, client._password, client._token))
+    finally:
+        session.close()
+    assert client.deleted == ["recovered-main"]
+
+
+@pytest.mark.parametrize("status,message", [
+    (400, "resource request rejected"),
+    (429, "AD 用户 Sandbox 配额不足，本次创建被拒绝"),
+])
+def test_rejected_author_create_records_error_without_lookup_or_retry(config, tmp_path, monkeypatch, status, message):
+    class Client:
+        base_url, resource = "http://platform", "pool"
+
+        def __init__(self):
+            self.posts = 0
+
+        def json(self, *args, **kwargs):
+            self.posts += 1
+            raise SandboxError(message, status)
+
+        def find_created(self, *args):
+            pytest.fail("A definite rejection must not enter uncertain-create recovery")
+
+    client = Client()
+    monkeypatch.setattr("task_builder.sandbox_session.SandboxClient", lambda: client)
+    session = AuthoringSandbox(config, tmp_path / "run", "paper", threading.Event())
+    with pytest.raises(SandboxError, match=message):
+        session.start()
+    saved = json.loads(session.path.read_text())
+    assert client.posts == 1
+    assert saved["phase"] == "create-failed"
+    assert saved["create_error_status"] == status
+    assert saved["create_error"] == message
+
+
+@pytest.mark.parametrize("status,message,rejected", [
+    (None, "connection interrupted", False),
+    (408, "timeout", False),
+    (429, "rate limit", False),
+    (429, "AD 用户 Sandbox 配额不足", True),
+    (503, "service unavailable", False),
+])
+def test_quota_rejection_is_distinct_from_uncertain_create(status, message, rejected):
+    from task_builder.sandbox_runtime import create_was_rejected
+    assert create_was_rejected(SandboxError(message, status)) is rejected
+
+
+def test_cancel_uncertain_author_create_does_not_resubmit(config, tmp_path, monkeypatch):
+    cancelled = threading.Event()
+
+    class Client:
+        base_url, resource = "http://platform", "pool"
+
+        def __init__(self):
+            self.posts = self.lookups = 0
+
+        def json(self, *args, **kwargs):
+            self.posts += 1
+            raise SandboxError("create response lost")
+
+        def find_created(self, *args):
+            self.lookups += 1
+            cancelled.set()
+            return []
+
+    client = Client()
+    monkeypatch.setattr("task_builder.sandbox_session.SandboxClient", lambda: client)
+    session = AuthoringSandbox(config, tmp_path / "run", "paper", cancelled)
+    with pytest.raises(SandboxError, match="创建已中断"):
+        session.start()
+    saved = json.loads(session.path.read_text())
+    assert client.posts == client.lookups == 1
+    assert saved["create_error"] == "create response lost"
+    assert saved["create_lookup_attempts"] == 1
+    assert saved["create_matches"] == 0
