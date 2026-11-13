@@ -20,6 +20,7 @@
 !/relay/relay.py
 !/relay/chat_compat.py
 !/relay/config.example.json
+!/relay/config.codex.example.json
 !/image/
 /image/*
 !/image/single-cell/
@@ -43,6 +44,11 @@
 !/tests/test_sandbox_runtime.py
 !/tests/test_sandbox_dispatch.py
 !/tests/test_agent_reads.py
+!/tests/test_codex.py
+!/tests/test_usage.py
+!/tests/test_task_package.py
+!/tests/test_artifact_history.py
+!/tests/test_sandbox_cleanup.py
 __pycache__/
 *.pyc
 .pytest_cache/

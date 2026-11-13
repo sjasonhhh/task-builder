@@ -19,14 +19,17 @@ def _positive_int(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="论文到科研任务生成", allow_abbrev=False)
+    parser = argparse.ArgumentParser(
+        description="论文到科研任务生成（造题程序在当前机器运行）", allow_abbrev=False,
+        epilog="使用独立造题沙盒请运行 bash run_sandbox.sh；可通过 --task-builder-image 更换造题镜像。",
+    )
     parser.add_argument("--sci-env", required=True, help="共享环境名：使用 image/<sci-env>/ 的环境文件与 image-env.toml，读取 <input>/<sci-env>/，输出到 <output>/<sci-env>/")
     parser.add_argument("--input", required=True, help="输入根目录；实际读取 <input>/<sci-env>/<来源>/")
     parser.add_argument("--output", required=True, help="输出根目录；实际写入 <output>/<sci-env>/")
     parser.add_argument("--resume-from", help="复用旧运行目录的计划和草稿；不改旧目录")
     parser.add_argument("--local-only", action="store_true", help="仅恢复与本地检查，不调用模型、不连接集群、不发布")
     parser.add_argument("--human-review", action="store_true", help="生成人工审核标记；名单中标为需要修改的成品直接进入修复")
-    parser.add_argument("--sandbox", action="store_true", help="通过通算沙盒运行 CPU 实验和评分；读取 config/sandbox.env")
+    parser.add_argument("--sandbox", action="store_true", help="造题仍在当前机器运行，CPU 实验和评分使用沙盒；读取 config/sandbox.env")
     parser.add_argument("--author-env", required=True, help="作者、审查和造任务模型配置")
     parser.add_argument("--model-relay", help="通用反代连接文件；启动前检查原开发机服务")
     parser.add_argument("--run-txt", "--run_txt", dest="run_txt", help="每行一个来源名（<input>/<sci-env>/ 下的目录名），只运行名单中尚未发布的任务")
@@ -48,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy-port", type=int, default=0, help="本机反代端口，0 表示自动选择")
     parser.add_argument("--proxy-host", help="RJob Worker 可访问的本机地址；默认自动探测")
     parser.add_argument("--claude-bin", default="claude")
+    parser.add_argument("--codex-bin", default="codex", help="Codex 程序名或路径")
     parser.add_argument("--agent-timeout-sec", type=_positive_int, help="覆盖 image-env 中的 Agent 超时时间（秒）")
     parser.add_argument("--harbor-timeout-sec", type=_positive_int, help="覆盖 image-env 中的 Harbor 超时时间（秒）")
     parser.add_argument("--task-timeout-sec", type=_positive_int, default=19800, help="每道造任务总时限，默认 19800 秒（5.5 小时）")
@@ -56,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if any(arg == "--task-builder-image" or arg.startswith("--task-builder-image=") for arg in argv):
+        parser.error("run.sh 不创建造题沙盒；请使用 bash run_sandbox.sh --task-builder-image 指定造题镜像")
     args = parser.parse_args(argv)
     values = vars(args)
     values["input_root"] = values.pop("input")

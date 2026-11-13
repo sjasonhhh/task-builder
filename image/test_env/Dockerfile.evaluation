@@ -1,67 +1,23 @@
-FROM denoland/deno:bin-2.9.4@sha256:25675bd2a125b59bdcfbb6592ec5c332a2bc56e0dabf038184d8b2c6aec45c3b AS deno
+# Reuse the published CNS experiment environment and add evaluation tools.
+ARG BASE_IMAGE=registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting@sha256:031d03bfdb4108e5e70a40cfe58b7764a7dee15191f0108ba698801f007d5d92
+FROM ${BASE_IMAGE}
+USER root
 
-FROM python:3.11-slim-bookworm
+RUN if ! dpkg-query -W -f='${Status}' libseccomp2 2>/dev/null | grep -Fx 'install ok installed'; then \
+        apt-get -o Acquire::Retries=3 update \
+        && apt-get install -y --no-install-recommends libseccomp2 \
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_INDEX_URL=https://pypi.org/simple/ \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DEFAULT_TIMEOUT=600 \
-    PIP_RETRIES=10 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility
-
-RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
-        sed -i \
-            -e 's|http://deb.debian.org/debian-security|http://mirrors.i.h.pjlab.org.cn/repository/debian-security-proxy|g' \
-            -e 's|http://deb.debian.org/debian|http://mirrors.i.h.pjlab.org.cn/repository/debian-proxy|g' \
-            -e 's|http://security.debian.org/debian-security|http://mirrors.i.h.pjlab.org.cn/repository/debian-security-proxy|g' \
-            /etc/apt/sources.list.d/debian.sources; \
-    fi; \
-    if [ -f /etc/apt/sources.list ]; then \
-        sed -i \
-            -e 's|http://deb.debian.org/debian-security|http://mirrors.i.h.pjlab.org.cn/repository/debian-security-proxy|g' \
-            -e 's|http://deb.debian.org/debian|http://mirrors.i.h.pjlab.org.cn/repository/debian-proxy|g' \
-            -e 's|http://security.debian.org/debian-security|http://mirrors.i.h.pjlab.org.cn/repository/debian-security-proxy|g' \
-            /etc/apt/sources.list; \
-    fi; \
-    for source in /etc/apt/sources.list.d/*.list; do \
-        [ -f "$source" ] || continue; \
-        sed -i \
-            -e 's|http://deb.debian.org/debian-security|http://mirrors.i.h.pjlab.org.cn/repository/debian-security-proxy|g' \
-            -e 's|http://deb.debian.org/debian|http://mirrors.i.h.pjlab.org.cn/repository/debian-proxy|g' \
-            -e 's|http://security.debian.org/debian-security|http://mirrors.i.h.pjlab.org.cn/repository/debian-security-proxy|g' \
-            "$source"; \
-    done
-
-RUN apt-get -o Acquire::Retries=3 update \
-    && apt-get install -y --no-install-recommends \
-        bash \
-        build-essential \
-        ca-certificates \
-        libgomp1 \
-        libseccomp2 \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* /root/.cache
-
-RUN python -m pip install --no-cache-dir \
-        --upgrade \
-        pip==24.2 \
-        setuptools==79.0.1 \
-        wheel==0.46.3
-
-# CUDA 12.1 版 torch：CUDA 运行库随 nvidia-* wheel 安装，GPU 节点只需宿主机驱动。
-RUN python -m pip install --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cu121 \
-        torch==2.4.1
-
-COPY requirements-evaluation.txt /tmp/requirements-evaluation.txt
-RUN python -m pip install --no-cache-dir --prefer-binary \
-        -r /tmp/requirements-evaluation.txt \
-    && rm -f /tmp/requirements-evaluation.txt
-
-COPY --from=deno /deno /usr/local/bin/deno
+COPY requirements-evaluation.txt /opt/cns/requirements-evaluation.txt
+RUN python -m pip freeze --all > /tmp/base-constraints.txt \
+    && python -m pip install --no-cache-dir --only-binary=:all: \
+        -c /tmp/base-constraints.txt -r /opt/cns/requirements-evaluation.txt \
+    && python -m pip check \
+    && rm /tmp/base-constraints.txt \
+    && mkdir -p /tests /app/results /logs/verifier \
+    && claude --version && tmux -V && deno --version
 
 WORKDIR /tests
-RUN mkdir -p /tests /app/results /logs/verifier
+CMD ["bash"]

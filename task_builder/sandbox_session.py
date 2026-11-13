@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .sandbox_runtime import (LIFETIME_MINUTES, RENEW_INTERVAL, STARTUP_TIMEOUT,
-                              SandboxClient, SandboxError)
+                              SandboxClient, SandboxError, author_lifetime_minutes, verified_expiry)
 from .sandbox_transfer import checked
 
 
@@ -28,7 +28,9 @@ class AuthoringSandbox:
                       "batch": run_root.name, "base_url": self.client.base_url,
                       "resource": self.client.resource, "retained": False,
                       "image": config.extra["sandbox_author_image"],
-                      "cpu": config.cpu, "memory_mb": config.memory_mb}
+                      "cpu": config.cpu, "memory_mb": config.memory_mb,
+                      "task_timeout_sec": config.task_timeout_sec,
+                      "lifecycle_minutes": author_lifetime_minutes(config.task_timeout_sec)}
         self.save(phase="prepared")
 
     def save(self, **changes):
@@ -51,6 +53,8 @@ class AuthoringSandbox:
     def start(self):
         self.check()
         end = time.monotonic() + STARTUP_TIMEOUT
+        lifetime = self.state["lifecycle_minutes"]
+        requested_expiry = datetime.now(timezone.utc) + timedelta(minutes=lifetime)
         payload = {
             "name": self.name, "resource": self.client.resource,
             "metadata": {"task_builder_run": self.name, "task_builder_role": "author",
@@ -58,7 +62,7 @@ class AuthoringSandbox:
             "image": {"uri": self.state["image"]}, "entrypoint": ["sleep", "inf"],
             "resources": {"cpu": str(self.state["cpu"]), "memory": f"{self.state['memory_mb']}Mi"},
             "ports": [{"containerPort": 44772, "name": "execd", "protocol": "tcp", "purpose": "system service"}],
-            "lifecycleMinutes": LIFETIME_MINUTES, "networkPolicy": {"defaultAction": "allow", "egress": []},
+            "lifecycleMinutes": lifetime, "networkPolicy": {"defaultAction": "allow", "egress": []},
         }
         self.save(phase="creating")
         try:
@@ -82,7 +86,7 @@ class AuthoringSandbox:
         if not self.id:
             raise SandboxError("创建响应缺少沙盒编号")
         self.save(phase="starting", sandbox_id=self.id,
-                  expires_at=(datetime.now(timezone.utc) + timedelta(minutes=LIFETIME_MINUTES)).isoformat())
+                  requested_expires_at=requested_expiry.isoformat())
         self.renew_thread = threading.Thread(target=self._renew, daemon=True)
         self.renew_thread.start()
         notice = 0
@@ -96,6 +100,7 @@ class AuthoringSandbox:
             if state in {"Failed", "Error", "Deleted", "Terminated"}:
                 raise SandboxError(f"造任务沙盒启动失败：{state}")
             if state == "Running":
+                self.save(expires_at=verified_expiry(detail, requested_expiry))
                 try:
                     self.command("true", deadline=end)
                     self.save(phase="running")
@@ -107,18 +112,31 @@ class AuthoringSandbox:
         raise SandboxError("造任务沙盒启动超过 60 分钟")
 
     def renew_once(self):
-        expires = datetime.now(timezone.utc) + timedelta(minutes=LIFETIME_MINUTES)
-        self.client.json("POST", self.client.api_path(f"/api/v1/sandboxes/{self.id}/renew"),
-                         {"expiresAt": expires.isoformat()}, deadline=time.monotonic() + 900)
-        self.save(expires_at=expires.isoformat())
+        checked_at = datetime.now(timezone.utc)
+        expires = checked_at + timedelta(minutes=LIFETIME_MINUTES)
+        # Long jobs already receive their full lifetime at creation. Sending the
+        # same expiry again is unnecessary and can be rejected by the platform.
+        current = self.state.get("expires_at")
+        if current and datetime.fromisoformat(current.replace("Z", "+00:00")) >= expires:
+            self.save(lifetime_checked_at=checked_at.isoformat(), renewal_skipped="existing_lifetime_sufficient")
+            return
+        confirmed = self.client.renew(self.id, expires, deadline=time.monotonic() + 900)
+        self.save(expires_at=confirmed, last_renewed_at=datetime.now(timezone.utc).isoformat(),
+                  renewal_skipped=None, renew_warning=None)
 
     def _renew(self):
         while not self.stop_renewing.wait(RENEW_INTERVAL):
             try:
                 self.renew_once()
-            except Exception:
-                self.renew_error = "造任务沙盒续期失败，正在回传已有结果"
-                self.save(renew_failed=True)
+            except Exception as exc:
+                current = self.state.get("expires_at")
+                if current and datetime.fromisoformat(current.replace("Z", "+00:00")) > datetime.now(timezone.utc) + timedelta(seconds=RENEW_INTERVAL + 600):
+                    # A failed extension does not cancel the already confirmed
+                    # allocation. Retry next hour while there is time to recover.
+                    self.save(renew_warning=str(exc), last_renew_attempt_at=datetime.now(timezone.utc).isoformat())
+                    continue
+                self.renew_error = "造任务沙盒续期失败，正在回传已有结果：" + str(exc)
+                self.save(renew_failed=True, renew_error=str(exc))
                 return
 
     def clean_children(self):
@@ -151,7 +169,18 @@ class AuthoringSandbox:
                 failures.append(self.id)
                 self.save(phase="cleanup-failed", retained=True)
         elif self.id:
-            self.save(phase="retained-for-recovery", retained=True)
+            try:
+                detail = self.client.detail(self.id)
+            except SandboxError as exc:
+                if exc.status != 404:
+                    self.save(phase="retention-unconfirmed", retained=False, retention_error=str(exc))
+                    raise
+                detail = {"state": "Deleted"}
+            state = (detail.get("status") or {}).get("state") or detail.get("state")
+            if state in {"Deleted", "Terminated", "Failed", "Error"}:
+                self.save(phase="missing", retained=False, platform_state=state)
+            else:
+                self.save(phase="retained-for-recovery", retained=True, platform_state=state)
         self.save(cleanup_failures=failures)
         if failures:
             raise SandboxError("部分沙盒尚未确认删除，详见 " + str(self.path))

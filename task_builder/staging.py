@@ -14,7 +14,8 @@ from pathlib import Path
 
 from .models import PipelineConfig, SourceBundle, StageFailure
 from .source_privacy import validate_public_description
-from .integrity import SOLVER_HIDDEN_DATA, leaked_withheld_files
+from .integrity import SOLVER_HIDDEN_DATA, content_manifest, leaked_withheld_files
+from .task_package import compose_context, is_standard_package, public_data
 from .deadline import remaining_timeout
 
 
@@ -41,20 +42,6 @@ def _set_table_value(text: str, table: str, key: str, value: str | int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _remove_environment_mode(text: str) -> str:
-    lines = text.splitlines()
-    output: list[str] = []
-    section = ""
-    for line in lines:
-        header = re.match(r"^\s*\[([^]]+)\]\s*$", line)
-        if header:
-            section = header.group(1)
-        if section == "verifier" and re.match(r"^\s*environment_mode\s*=", line):
-            continue
-        output.append(line)
-    return "\n".join(output) + "\n"
-
-
 def _task_files(draft: Path, target: Path, *, include_readme: bool = False) -> None:
     for relative in ("task.toml", "instruction.md", "solution", "tests"):
         source_path = draft / relative
@@ -68,11 +55,14 @@ def _task_files(draft: Path, target: Path, *, include_readme: bool = False) -> N
             shutil.copy2(source_path, destination)
     if include_readme:
         shutil.copy2(draft / "README.md", target / "README.md")
+    if (draft / "environment").is_dir():
+        shutil.copytree(draft / "environment", target / "environment",
+                        ignore=lambda path, names: ["data"] if Path(path) == draft / "environment" else [])
 
 
 def _copy_writer_data(draft: Path, source: SourceBundle, target: Path) -> None:
     """任务 data/ 完全由 Writer/Repair 在草稿 data/ 中准备，程序只做防泄漏检查后原样复制。"""
-    draft_data = draft / "data"
+    draft_data = public_data(draft)
     if not draft_data.is_dir() or not any(path.is_file() for path in draft_data.rglob("*")):
         raise StageFailure("草稿 data/ 为空：求解者数据由 Writer 按计划 data_split 复制、改名或转换后放入草稿 data/", stage="validation-data")
     hidden = sorted(path.name for path in draft_data.iterdir() if path.name in SOLVER_HIDDEN_DATA)
@@ -87,11 +77,25 @@ def _copy_writer_data(draft: Path, source: SourceBundle, target: Path) -> None:
     leaked = leaked_withheld_files(draft_data, source.data, json.loads(plan_path.read_text(encoding="utf-8")))
     if leaked:
         raise StageFailure("草稿 data/ 中以下文件与计划标为 author_result / evaluation_reference 的来源文件内容相同，不能交给求解者: " + ", ".join(leaked), stage="validation-data")
-    shutil.copytree(draft_data, target / "data", dirs_exist_ok=True)
+    shutil.copytree(draft_data, target / "environment/data", dirs_exist_ok=True)
 
 
 def _copy_task_data(draft: Path, source: SourceBundle, target: Path, config: PipelineConfig) -> None:
-    _copy_writer_data(draft, source, target)
+    for attempt in range(3):
+        try:
+            _copy_writer_data(draft, source, target)
+            return
+        except (OSError, StageFailure) as exc:
+            if isinstance(exc, StageFailure) and exc.stage == "task-timeout":
+                raise
+            if isinstance(exc, StageFailure) and exc.stage == "validation-data" and "复制不完整" not in str(exc):
+                raise
+            if attempt == 2:
+                raise
+            copied_data = target / "environment/data"
+            if copied_data.exists():
+                shutil.rmtree(copied_data)
+            time.sleep(remaining_timeout((5, 15)[attempt]))
 
 
 def validate_task_config(task_path: Path) -> None:
@@ -149,10 +153,19 @@ def validate_task_metadata(task_path: Path) -> None:
 def finalize_harbor_task(target: Path, config: PipelineConfig, *, agent_timeout_sec: int | None = None) -> Path:
     """两条运行路径（造任务验证与 run_task 答题）共用的 Harbor 任务收尾步骤。"""
     environment = target / "environment"
-    environment.mkdir()
-    shutil.copytree(target / "data", environment / "data")
+    if is_standard_package(target):
+        if config.environment_dir is None:
+            raise StageFailure("缺少共享环境目录", stage="task-package")
+        compose_context(environment, config.environment_dir, "experiment", config.experiment_image, "")
+        compose_context(target / "tests", config.environment_dir, "evaluation", config.evaluation_image, "")
+    else:
+        if (environment / "Dockerfile").is_file():
+            raise StageFailure("标准任务包缺少 tests/Dockerfile", stage="task-package")
+        # Old published tasks retain their original input behavior and scores.
+        environment.mkdir(exist_ok=True)
+        shutil.copytree(target / "data", environment / "data", dirs_exist_ok=True)
     task_path = target / "task.toml"
-    text = _remove_environment_mode(task_path.read_text(encoding="utf-8"))
+    text = _set_table_value(task_path.read_text(encoding="utf-8"), "verifier", "environment_mode", "separate")
     for table, image in (("environment", config.experiment_image), ("verifier.environment", config.evaluation_image)):
         text = _set_table_value(text, table, "docker_image", image)
         text = _set_table_value(text, table, "network_mode", "no-network")
@@ -164,7 +177,32 @@ def finalize_harbor_task(target: Path, config: PipelineConfig, *, agent_timeout_
     return target
 
 
+def assemble_task_package(draft: Path, source: SourceBundle, target: Path, config: PipelineConfig) -> Path:
+    """Build the portable artifact used by both validation and publication."""
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    _task_files(draft, target, include_readme=True)
+    _copy_task_data(draft, source, target, config)
+    if config.environment_dir is None:
+        raise StageFailure("缺少当前领域的共享环境目录", stage="task-package")
+    if not (target / "tests/Dockerfile").is_file():
+        raise StageFailure("草稿缺少 tests/Dockerfile；评测源文件可以使用任意名称", stage="task-package")
+    compose_context(target / "environment", config.environment_dir, "experiment", config.experiment_image,
+                    'COPY data/ /workspace/data/\nRUN mkdir -p /app/results && ln -sfn /workspace/data /app/inputs\nWORKDIR /workspace\n')
+    compose_context(target / "tests", config.environment_dir, "evaluation", config.evaluation_image, "")
+    task_path = target / "task.toml"
+    _strip_image_values(task_path)
+    text = _set_table_value(task_path.read_text(), "verifier", "environment_mode", "separate")
+    task_path.write_text(text)
+    validate_task_config(task_path)
+    return target
+
+
 def prepare_harbor_task(draft: Path, source: SourceBundle, target: Path, config: PipelineConfig) -> Path:
+    portable = target.with_name("package")
+    assemble_task_package(draft, source, portable, config)
+    (target.parent / "package-source.json").write_text(json.dumps(content_manifest(draft), sort_keys=True))
     if target.exists():
         for path in target.iterdir():
             if path.name == "harbor-jobs":
@@ -174,21 +212,7 @@ def prepare_harbor_task(draft: Path, source: SourceBundle, target: Path, config:
             else:
                 path.unlink()
     target.mkdir(parents=True, exist_ok=True)
-    _task_files(draft, target)
-    for attempt in range(3):
-        try:
-            _copy_task_data(draft, source, target, config)
-            break
-        except (OSError, StageFailure) as exc:
-            if isinstance(exc, StageFailure) and exc.stage == "task-timeout":
-                raise
-            if isinstance(exc, StageFailure) and exc.stage == "validation-data" and "复制不完整" not in str(exc):
-                raise
-            if attempt == 2:
-                raise
-            if (target / "data").exists():
-                shutil.rmtree(target / "data")
-            time.sleep(remaining_timeout((5, 15)[attempt]))
+    shutil.copytree(portable, target, dirs_exist_ok=True)
     finalize_harbor_task(target, config)
     return target
 
@@ -202,8 +226,6 @@ def _strip_image_values(task_path: Path) -> None:
         if header:
             section = header.group(1)
         if section in {"environment", "verifier.environment"} and re.match(r"^\s*docker_image\s*=", line):
-            continue
-        if section == "verifier" and re.match(r"^\s*environment_mode\s*=", line):
             continue
         output.append(line)
     cleaned: list[str] = []
@@ -238,11 +260,14 @@ def publish_task(draft: Path, source: SourceBundle, output_root: Path, config: P
     for path in (temporary, backup):
         if path.exists():
             shutil.rmtree(path)
-    temporary.mkdir(parents=True)
-    _task_files(draft, temporary, include_readme=True)
-    _copy_task_data(draft, source, temporary, config)
-    _strip_image_values(temporary / "task.toml")
-    validate_task_config(temporary / "task.toml")
+    portable = draft.parent / "validation/package"
+    fingerprint = draft.parent / "validation/package-source.json"
+    if portable.is_dir() and fingerprint.is_file():
+        if json.loads(fingerprint.read_text()) != content_manifest(draft):
+            raise StageFailure("运行验证后草稿已变化，需要重新验证再发布", stage="task-package")
+        shutil.copytree(portable, temporary)
+    else:
+        assemble_task_package(draft, source, temporary, config)
     target = output_root / source.source_slug
     moved_old = False
     try:

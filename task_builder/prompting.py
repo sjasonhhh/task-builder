@@ -8,6 +8,7 @@ import json
 
 from .integrity import content_manifest, leaked_withheld_files
 from .workspace import ENVIRONMENT_FILES
+from .task_package import public_data
 
 _PROMPT_ROOT = Path(__file__).with_name("prompts")
 
@@ -91,7 +92,7 @@ def draft_manifest(draft_dir: Path) -> str:
 
 def task_data_manifest(source_data: Path, draft_dir: Path, plan_path: Path) -> str:
     """求解者实际可见的任务 data/（即草稿 data/），附程序的防泄漏核对结果。"""
-    draft_data = draft_dir / "data"
+    draft_data = public_data(draft_dir)
     entries = content_manifest(draft_data) if draft_data.is_dir() else {}
     lines = [
         f"data/{name}/" if entry.get("kind") == "directory" else f"data/{name} ({entry.get('size', '?')} bytes)"

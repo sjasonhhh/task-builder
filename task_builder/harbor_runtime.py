@@ -26,6 +26,8 @@ from .claude_proxy import (
 )
 from .config import load_agent_env
 from .hcluster_runtime import resolve_claude_source
+from .agent_config import AUTH_KEYS, model_connection, codex_settings
+from .agent_runtime import resolve_codex_source
 
 
 @dataclass(frozen=True)
@@ -306,6 +308,7 @@ def _run_managed_harbor(command: list[str], task_dir: Path, env: dict[str, str],
 
 
 def run_harbor_agent(task_dir: Path, config: PipelineConfig, *, agent: str, env_file: Path | None = None, model: str | None = None, job_name: str) -> HarborRunResult:
+    agent_env = load_agent_env(env_file, role="模型代理") if env_file is not None else None
     jobs_dir = task_dir / "harbor-jobs" / job_name
     jobs_dir.mkdir(parents=True, exist_ok=True)
     previous_run_names = {path.name for path in jobs_dir.iterdir() if path.is_dir()}
@@ -325,13 +328,13 @@ def run_harbor_agent(task_dir: Path, config: PipelineConfig, *, agent: str, env_
     selected_model = model
     # 造任务验证（非 managed）通过 claude-opus-4-8 别名加 modelOverrides 使用非 Claude 模型；
     # run_task（managed）经反代直接透传模型名，两条路径在此有意不同。
-    if selected_model and not config.extra.get("managed_harbor") and not (selected_model.startswith("claude-") or selected_model in {"sonnet", "opus", "haiku"}):
+    if agent == "claude-code" and selected_model and not config.extra.get("managed_harbor") and not (selected_model.startswith("claude-") or selected_model in {"sonnet", "opus", "haiku"}):
         selected_model = "claude-opus-4-8"
     if selected_model:
         command.extend(["--model", selected_model])
     env = os.environ.copy()
-    env.pop("ANTHROPIC_API_KEY", None)
-    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    for key in AUTH_KEYS:
+        env.pop(key, None)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get("PYTHONPATH", "")
     env["TASK_BUILDER_RJOB_NAMESPACE"] = config.namespace
     env["TASK_BUILDER_CHARGED_GROUP"] = config.charged_group
@@ -344,8 +347,11 @@ def run_harbor_agent(task_dir: Path, config: PipelineConfig, *, agent: str, env_
     env["TASK_BUILDER_EXPERIMENT_IMAGE"] = config.experiment_image
     env["TASK_BUILDER_EVALUATION_IMAGE"] = config.evaluation_image
     env["TASK_BUILDER_RUNTIME_LOG_DIR"] = str(jobs_dir / "runtime-logs")
-    # 两条运行路径都显式指定上传到 RJob 的 Claude Code，可执行文件由 --claude-bin 决定。
-    env["TASK_BUILDER_CLAUDE_SOURCE"] = config.extra.get("claude_source") or str(resolve_claude_source(config.claude_bin))
+    env["TASK_BUILDER_AGENT"] = agent
+    if agent == "claude-code":
+        env["TASK_BUILDER_CLAUDE_SOURCE"] = config.extra.get("claude_source") or str(resolve_claude_source(config.claude_bin))
+    elif agent == "codex":
+        env["TASK_BUILDER_CODEX_SOURCE"] = config.extra.get("codex_source") or str(resolve_codex_source(config.codex_bin))
     if config.extra.get("managed_harbor"):
         command.extend(["--agent-setup-timeout-multiplier", "5"])
     temporary_token: str | None = None
@@ -374,7 +380,6 @@ def run_harbor_agent(task_dir: Path, config: PipelineConfig, *, agent: str, env_
             started_ns = time.time_ns()
             completed = execute()
         else:
-            agent_env = load_agent_env(env_file, role="模型代理")
             if config.model_relay:
                 from .model_relay import relay_module, selected_relay_entry
 
@@ -384,11 +389,10 @@ def run_harbor_agent(task_dir: Path, config: PipelineConfig, *, agent: str, env_
                 advertised_host = urlsplit(worker_base_url).hostname
                 scope = nullcontext()
                 env = relay_module().proxy_environment(entry, env)
-                for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+                for key in AUTH_KEYS:
                     env.pop(key, None)
             elif direct_model:
-                worker_base_url = agent_env.values["ANTHROPIC_BASE_URL"]
-                temporary_token = agent_env.values.get("ANTHROPIC_AUTH_TOKEN") or agent_env.values["ANTHROPIC_API_KEY"]
+                worker_base_url, temporary_token = model_connection(agent_env.values, agent_env.agent)
                 advertised_host = urlsplit(worker_base_url).hostname
                 scope = nullcontext()
             else:
@@ -409,14 +413,13 @@ def run_harbor_agent(task_dir: Path, config: PipelineConfig, *, agent: str, env_
                     agent_env,
                     WorkerProxyCredentials(worker_base_url, temporary_token, selected_model or "claude-opus-4-8"),
                 )
-                proxy_env_names = {
-                    "ANTHROPIC_BASE_URL": "TASK_BUILDER_PROXY_BASE_URL",
-                    "ANTHROPIC_AUTH_TOKEN": "TASK_BUILDER_PROXY_TOKEN",
-                }
-                if direct_model and not agent_env.values.get("ANTHROPIC_AUTH_TOKEN"):
+                base_key = "OPENAI_BASE_URL" if agent == "codex" else "ANTHROPIC_BASE_URL"
+                token_key = "OPENAI_API_KEY" if agent == "codex" else "ANTHROPIC_AUTH_TOKEN"
+                proxy_env_names = {base_key: "TASK_BUILDER_PROXY_BASE_URL", token_key: "TASK_BUILDER_PROXY_TOKEN"}
+                if agent == "claude-code" and direct_model and not agent_env.values.get("ANTHROPIC_AUTH_TOKEN"):
                     worker_values["ANTHROPIC_API_KEY"] = worker_values.pop("ANTHROPIC_AUTH_TOKEN")
                     proxy_env_names["ANTHROPIC_API_KEY"] = "TASK_BUILDER_PROXY_TOKEN"
-                env["TASK_BUILDER_PROXY_BASE_URL"] = worker_values["ANTHROPIC_BASE_URL"]
+                env["TASK_BUILDER_PROXY_BASE_URL"] = worker_values[base_key]
                 env["TASK_BUILDER_PROXY_TOKEN"] = temporary_token
                 for key, value in worker_values.items():
                     if key in proxy_env_names:
@@ -425,7 +428,12 @@ def run_harbor_agent(task_dir: Path, config: PipelineConfig, *, agent: str, env_
                         command.extend(["--ae", f"{key}={value}"])
                     elif key == "REASONING_EFFORT":
                         command.extend(["--ae", f"{key}={value}"])
-                if selected_model and not config.extra.get("managed_harbor"):
+                if agent == "codex":
+                    settings = codex_settings(worker_values[base_key], agent_env.values.get("REASONING_EFFORT"))
+                    command.extend(["--ak", "config=" + json.dumps(settings, separators=(",", ":"))])
+                    if agent_env.values.get("REASONING_EFFORT"):
+                        command.extend(["--ak", "reasoning_effort=" + agent_env.values["REASONING_EFFORT"]])
+                elif selected_model and not config.extra.get("managed_harbor"):
                     settings = claude_code_settings(model or selected_model)
                     if settings:
                         command.extend(["--ak", "config=" + json.dumps(settings, separators=(",", ":"))])

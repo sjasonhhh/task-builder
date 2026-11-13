@@ -37,7 +37,7 @@ REVIEW_TEMPLATE = f"""状态：待审核
 
 这些提示只是帮助专家思考，不用逐项填写，只写发现的问题即可。
 """
-TASK_PARTS = ("instruction.md", "README.md", "task.toml", "solution", "tests", "data")
+TASK_PARTS = ("instruction.md", "README.md", "task.toml", "solution", "tests", "environment", "data")
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -198,6 +198,10 @@ def restore_for_review(source, config, workspace) -> None:
             shutil.copytree(item, workspace.draft_dir / name)
         elif item.is_file():
             shutil.copy2(item, workspace.draft_dir / name)
+    # Authors retain the established draft/data editing interface.
+    packaged_data = workspace.draft_dir / "environment/data"
+    if packaged_data.is_dir() and not (workspace.draft_dir / "data").exists():
+        packaged_data.rename(workspace.draft_dir / "data")
     _write_json(history / "round.json", {"previous_run": str(run), "started": time.time()})
     record_outcome(workspace, "repairing", previous_run=str(run))
 

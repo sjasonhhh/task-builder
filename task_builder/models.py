@@ -67,6 +67,7 @@ class PipelineConfig:
     proxy_port: int = 0
     proxy_host: str | None = None
     claude_bin: str = "claude"
+    codex_bin: str = "codex"
     agent_timeout_sec: int = 3600
     harbor_timeout_sec: int = 3600
     task_timeout_sec: int = 19800

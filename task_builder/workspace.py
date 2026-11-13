@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .models import PipelineConfig, SourceBundle
 from .integrity import file_digest
+from .artifact_history import copy_history
 from .paths import ENV_IMAGE_CONFIG_NAME, SCIENV_IMAGE_ROOT
 
 # 共享环境 image/<env>/ 必须包含的文件；这些文件会复制进运行目录 shared/<env>/，并全文写入 agent 提示词。
@@ -145,12 +146,8 @@ def snapshot_draft(workspace: SourceWorkspace, cycle: int) -> Path:
     snapshot = workspace.reviews_dir / f"draft-before-repair-{cycle:03d}"
     if snapshot.exists():
         shutil.rmtree(snapshot)
-    # 快照只作修复前的证据；data/ 可能很大且每轮都要复制，只记录清单不复制内容。
-    shutil.copytree(workspace.draft_dir, snapshot, ignore=lambda directory, names: ["data"] if Path(directory) == workspace.draft_dir and "data" in names else [])
-    data = workspace.draft_dir / "data"
-    if data.is_dir():
-        listing = [f"{path.relative_to(data).as_posix()} {path.stat().st_size}" for path in sorted(data.rglob("*")) if path.is_file()]
-        (snapshot / "data-manifest.txt").write_text("\n".join(listing) + "\n", encoding="utf-8")
+    # Historical evidence is not another runnable copy of all task data.
+    copy_history(workspace.draft_dir, snapshot, compact_all=True)
     return snapshot
 
 

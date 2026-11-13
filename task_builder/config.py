@@ -11,6 +11,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 
 from .models import ConfigError, EnvConfig, ImageEnvConfig, PipelineConfig
 from .paths import ENV_IMAGE_CONFIG_NAME, PROJECT_RUBRIC, SCIENV_IMAGE_ROOT
+from .agent_config import AUTH_KEYS, agent_name, model_connection
 
 
 def _unquote(value: str) -> str:
@@ -45,23 +46,29 @@ def read_env_file(path: Path) -> dict[str, str]:
 
 def load_agent_env(path: Path, *, role: str) -> EnvConfig:
     values = read_env_file(path)
+    try:
+        agent = agent_name(values)
+    except ValueError as exc:
+        raise ConfigError(f"{role}: {exc}") from exc
+    base_url, token = model_connection(values, agent)
     missing: list[str] = []
     if not values.get("MODEL_ID"):
         missing.append("MODEL_ID")
-    if not values.get("ANTHROPIC_BASE_URL"):
-        missing.append("ANTHROPIC_BASE_URL")
-    if not values.get("ANTHROPIC_AUTH_TOKEN") and not values.get("ANTHROPIC_API_KEY"):
-        missing.append("ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY")
+    if not base_url:
+        missing.append("OPENAI_BASE_URL 或 ANTHROPIC_BASE_URL" if agent == "codex" else "ANTHROPIC_BASE_URL")
+    if not token:
+        missing.append("OPENAI_API_KEY 或 ANTHROPIC_AUTH_TOKEN" if agent == "codex" else "ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY")
     if missing:
         raise ConfigError(f"{role} 配置缺少: {', '.join(missing)}")
     if any("<" in value or ">" in value for value in values.values()):
         raise ConfigError(f"{role} 尚未填写实际配置: {path}")
-    agent = values.get("AGENT", "claude-code").strip().lower().replace("_", "-")
-    if agent in {"claude", "claude-cli"}:
-        agent = "claude-code"
-    if agent != "claude-code":
-        raise ConfigError(f"{role} 必须使用 Claude Code，当前 AGENT={agent!r}")
-    return EnvConfig(path=path.resolve(), model_id=values["MODEL_ID"], values=values)
+    from urllib.parse import urlsplit
+    address = urlsplit(base_url)
+    if address.scheme not in {"http", "https"} or not address.hostname or address.username or address.password or address.query or address.fragment:
+        raise ConfigError(f"{role} 的模型接口必须是有效的 HTTP(S) 地址")
+    if "\n" in token or "\r" in token:
+        raise ConfigError(f"{role} 的模型密钥不能包含换行")
+    return EnvConfig(path=path.resolve(), model_id=values["MODEL_ID"], values=values, agent=agent)
 
 
 def _toml_table(document: dict, name: str, path: Path) -> dict:
@@ -168,6 +175,7 @@ def build_config(
     proxy_port: int = 0,
     proxy_host: str | None = None,
     claude_bin: str = "claude",
+    codex_bin: str = "codex",
     agent_timeout_sec: int | None = None,
     harbor_timeout_sec: int | None = None,
     task_timeout_sec: int = 19800,
@@ -247,6 +255,7 @@ def build_config(
         proxy_port=proxy_port,
         proxy_host=proxy_host,
         claude_bin=claude_bin,
+        codex_bin=codex_bin,
         agent_timeout_sec=agent_timeout_sec,
         harbor_timeout_sec=harbor_timeout_sec,
         task_timeout_sec=task_timeout_sec,
@@ -261,6 +270,8 @@ def build_config(
 
 def environment_for_subprocess(config: EnvConfig, *, model_id: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
+    for key in AUTH_KEYS:
+        env.pop(key, None)
     if env.get("TASK_BUILDER_DIRECT_MODELS") == "1":
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
             env.pop(key, None)
@@ -274,6 +285,14 @@ def environment_for_subprocess(config: EnvConfig, *, model_id: str | None = None
     if os.environ.get("TASK_BUILDER_DIRECT_MODELS") == "1":
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
             env.pop(key, None)
+    if config.agent == "codex":
+        base_url, token = model_connection(config.values, config.agent)
+        for key in (*AUTH_KEYS, "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"):
+            env.pop(key, None)
+        env["OPENAI_BASE_URL"] = base_url
+        env["OPENAI_API_KEY"] = token
+        return env
+    env.pop("OPENAI_BASE_URL", None)
     env["ANTHROPIC_MODEL"] = model_id or config.model_id
     env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
     if not env.get("ANTHROPIC_API_KEY") and env.get("ANTHROPIC_AUTH_TOKEN"):

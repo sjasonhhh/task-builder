@@ -14,6 +14,63 @@ from task_builder.agents import IndependentClaudeAgent, _deny_read
 from task_builder.models import EnvConfig
 
 
+@pytest.mark.parametrize("extra_logs", [0, 60])
+def test_repair_prompt_preserves_latest_failure_with_history_limits(tmp_path, monkeypatch, extra_logs):
+    from task_builder import writer_agent
+
+    workspace = SimpleNamespace(source_root=tmp_path)
+    for field in ("shared", "input", "plan", "draft", "reviews", "validation", "logs", "failures"):
+        directory = tmp_path / field
+        directory.mkdir()
+        setattr(workspace, field + "_dir", directory)
+    (workspace.plan_dir / "plan.json").write_text("{}")
+    workspace.events = workspace.logs_dir / "events.jsonl"
+    history = {
+        workspace.failures_dir / "previous.txt": "FAILURE_BEGIN\n" + "旧失败\n" * 45_000 + "FAILURE_END",
+        workspace.reviews_dir / "review.json": json.dumps({"advice": "旧审核\n" * 45_000}, ensure_ascii=False),
+        workspace.validation_dir / "report.txt": "VALIDATION_BEGIN\n" + "旧检查\n" * 45_000 + "VALIDATION_END",
+        workspace.logs_dir / "previous.log": "LOG_BEGIN\n" + "旧日志\n" * 45_000 + "LOG_END",
+    }
+    assert sum(map(len, history.values())) > 600_000
+    for index in range(extra_logs):
+        history[workspace.logs_dir / f"z-history-{index:03d}.log"] = f"BEGIN_{index}\n" + "x" * 13_000 + f"\nEND_{index}"
+    for path, content in history.items():
+        path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(writer_agent, "read_shared_material", lambda _: ("rubric", "test_env", "environment"))
+    monkeypatch.setattr(writer_agent, "source_manifest", lambda _: "source files")
+    captured = {}
+
+    def run(**options):
+        captured.update(options)
+        raise RuntimeError("prompt captured without a model call")
+
+    failure = "reviewer: Harbor task.toml 缺少 [task] 表"
+    with pytest.raises(RuntimeError, match="prompt captured"):
+        writer_agent.run_repair_writer_agent(
+            None, SimpleNamespace(author_env=None), workspace, SimpleNamespace(run=run), failure,
+        )
+    prompt = captured["prompt"]
+    evidence = prompt.split("本轮失败及历史参考：\n", 1)[1].split("\n\n只允许修改", 1)[0]
+    assert evidence.startswith("当前失败摘要：\n" + failure)
+    assert prompt.index(failure) < prompt.index("来源文件清单")
+    assert len(evidence) <= 600_000
+    if extra_logs:
+        assert len(evidence) == 600_000
+        path = workspace.logs_dir / f"z-history-{extra_logs - 1:03d}.log"
+        assert f"\n===== {path} =====\n{history[path][-12_000:]}" in evidence
+    else:
+        for path, content in history.items():
+            assert f"\n===== {path} =====\n{content[-12_000:]}" in evidence
+
+
+def test_current_failure_is_never_truncated_even_above_history_budget(tmp_path):
+    from task_builder.writer_agent import _failure_evidence
+
+    workspace = SimpleNamespace(**{name + "_dir": tmp_path / name for name in ("failures", "reviews", "validation", "logs")})
+    failure = "最新失败开始\n" + "错误" * 300_000 + "\n最新失败结束"
+    assert _failure_evidence(workspace, failure) == "当前失败摘要：\n" + failure
+
+
 @pytest.mark.parametrize("suffix", [".txt", ".csv", ".tsv", ".jsonl", ".smi", ".smiles", ".sdf", ".fasta", ".fastq", ".pdb", ".log", ""])
 def test_large_text_is_not_denied_by_total_size(tmp_path, suffix):
     path = tmp_path / ("data" + suffix)
@@ -81,7 +138,7 @@ def test_native_read_budget_applies_to_every_model_call(tmp_path, monkeypatch, c
     def execute(command, **kwargs):
         observed.append(kwargs["env"]["CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"])
         return subprocess.CompletedProcess(command, 0, "done", "")
-    monkeypatch.setattr("task_builder.agents.subprocess.run", execute)
+    monkeypatch.setattr("task_builder.agents.run_process", execute)
     for role in ("planner", "writer", "reviewer", "repair-writer"):
         IndependentClaudeAgent().run(role=role, prompt="task", workdir=tmp_path / role, env_config=env)
     assert observed == [expected] * 4
@@ -194,6 +251,10 @@ def test_real_claude_can_preview_large_text_and_retry_oversized_read(tmp_path, m
             server.shutdown()
             thread.join(timeout=5)
     assert result.returncode == 0
+    from task_builder.usage import source_summary
+    usage = source_summary(tmp_path, {})
+    assert usage["input_tokens"] == 400 and usage["output_tokens"] == 4
+    assert usage["api_requests"] == 4 and usage["incomplete_invocations"] == 0
     assert len(observed) == len(calls)
     def content(index):
         return str(observed[f"toolu_read_{index}"].get("content", ""))

@@ -48,6 +48,8 @@ def _review_response(text: str) -> dict:
 
 
 def run_reviewer_agent(source: SourceBundle, config: PipelineConfig, workspace: SourceWorkspace, agent: IndependentClaudeAgent, *, cycle: int) -> dict:
+    from .writer_agent import _check_draft
+    _check_draft(workspace.draft_dir, stage="reviewer")
     validate_task_config(workspace.draft_dir / "task.toml")
     validate_task_metadata(workspace.draft_dir / "task.toml")
     view = _review_view(workspace, cycle)

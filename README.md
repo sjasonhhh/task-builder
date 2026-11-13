@@ -13,11 +13,11 @@
 
 ### 1. 下载与安装
 
-需要 Python 3.12+、Git LFS 和 `patch`。执行造题或答题程序的机器需具备相应的 Claude Code 环境。
+需要 Python 3.12+、Git LFS 和 `patch`。执行造题或答题程序的机器需具备所选的 Claude Code 或 Codex。
 
 ```bash
-export TB="/mnt/shared-storage-user/cl4mind/data/scienv/task-builder" # 项目绝对路径，按实际位置修改
-export SCI_ENV=chemistry # 领域名，对应 inputs/ 和 image/ 下的同名目录
+export TB="/mnt/shared-storage-user/cl4mind/data/scienv/task-builder"
+export SCI_ENV=test_env
 
 git lfs install
 git clone https://github.com/sjasonhhh/task-builder.git "$TB"
@@ -147,7 +147,7 @@ python3 "$TB/relay/relay.py" start
 
 bash "$TB/scripts/start_worker.sh" \
   --sci-env "$SCI_ENV" \
-  --image "<造题worker镜像地址>" \
+  --image "registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting:scienv-test_env-cns-experiment-cu118-20261112-143239" \
   --cpu 16 \
   --memory-mb 65536 \
   --gpus 1
@@ -236,10 +236,6 @@ python3 "$TB/relay/relay.py" stop
 
 需要沙盒平台账号和资源池访问权限，模型接口应能从沙盒直接访问。
 
-每篇论文使用独立造题沙盒，实验与评分分别使用另外的沙盒。造题沙盒默认使用 `image-env.toml` 中的实验镜像，CPU 和内存读取 `max_cpu`、`max_memory_mb`。
-
-造题镜像需要预装 Claude Code，以及位于 `/opt/orch/venv` 的 Python 3.12+、Harbor 0.22.0 和项目补丁。使用其他造题镜像时，可通过 `--image` 指定。
-
 ### 1. 配置沙盒
 
 ```bash
@@ -269,7 +265,8 @@ bash "$TB/run_sandbox.sh" \
   --human-review \
   --max-revisions 3 \
   --concurrency 1 \
-  --task-timeout-sec 19800
+  --task-timeout-sec 19800 \
+  --task-builder-image "registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting@sha256:9871a689fce9c97bb114ac06c065c45f1d8954a62d60a45343d2ebb51e7b52b0"
 ```
 
 ### 3. 继续已有运行
@@ -294,7 +291,7 @@ bash "$TB/run_sandbox.sh" \
 
 ### 1. 共用准备
 
-运行前，请先从[飞书页面](https://aicarrier.feishu.cn/wiki/T5fpw1UiLinWLfkpkeXczBnBn8b#share-MIQbdUQc2omG2WxXEVdc5qTXnKh)下载任务包，解压到 `output/test_env/final/`。目录名是 `final`，没有 s。每个任务目录内应有 `task.toml`、`instruction.md`、`data/`、`solution/` 和 `tests/`。
+运行前，请先从[飞书页面](https://aicarrier.feishu.cn/wiki/T5fpw1UiLinWLfkpkeXczBnBn8b#share-MIQbdUQc2omG2WxXEVdc5qTXnKh)下载任务包，解压到 `output/test_env/final/`。目录名是 `final`，没有 s。
 
 ```text
 output/test_env/final/
@@ -428,3 +425,36 @@ output/
 - `final/`：生成的任务。
 - `runs/`：造题计划、草稿、日志和验证记录。
 - `agent-runs/`：独立答题与评分结果。
+
+## Codex
+
+```bash
+export TB="/mnt/shared-storage-user/cl4mind/data/scienv/task-builder"
+export SCI_ENV=chemistry
+cd "$TB"
+cp -n config/codex.env.example config/codex.env
+vi config/codex.env
+cp -n config/run-codex.txt.example config/run-codex.txt
+
+bash run_sandbox.sh \
+  --sci-env "$SCI_ENV" --input inputs --output output/codex-sandbox \
+  --author-env config/codex.env --run-txt config/run-codex.txt \
+  --concurrency 1 --max-revisions 3 --task-timeout-sec 19800
+
+bash run.sh --sandbox \
+  --sci-env "$SCI_ENV" --input inputs --output output/codex-local-sandbox \
+  --author-env config/codex.env --run-txt config/run-codex.txt \
+  --concurrency 1 --max-revisions 3 --task-timeout-sec 19800
+
+mkdir -p relay/codex
+cp -n relay/config.codex.example.json relay/codex/config.json
+.venv/bin/python relay/relay.py --config relay/codex/config.json start
+
+bash run.sh \
+  --sci-env "$SCI_ENV" --input inputs --output output/codex-hcluster \
+  --author-env config/codex.env --run-txt config/run-codex.txt \
+  --model-relay relay/codex/connection.json \
+  --concurrency 1 --max-revisions 3 --task-timeout-sec 19800
+
+.venv/bin/python relay/relay.py --config relay/codex/config.json stop
+```

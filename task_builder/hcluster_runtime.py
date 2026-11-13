@@ -121,6 +121,8 @@ class TaskBuilderRJobEnvironment(BaseEnvironment):
     def _default_cwd(self) -> str:
         if self.task_env_config.workdir:
             return self.task_env_config.workdir
+        if getattr(self, "_package_cwd", None):
+            return self._package_cwd
         return parse_dockerfile_workdir(self.environment_dir / "Dockerfile") or "/workspace"
 
     @property
@@ -355,6 +357,16 @@ class TaskBuilderRJobEnvironment(BaseEnvironment):
         prepared = self._brainctl_exec("mkdir -p /workspace /tests /logs/agent /logs/verifier /logs/artifacts /state", timeout=180)
         if prepared.return_code != 0:
             raise RuntimeError(prepared.stderr or prepared.stdout or "准备远程目录失败")
+        from .task_package import install_context, is_standard_package
+        if is_standard_package(self.environment_dir.parent):
+            try:
+                await install_context(self, verifier=self._is_verifier)
+                if not self._is_verifier:
+                    await self._install_agent_runtime()
+            except BaseException:
+                await self.stop(delete=True)
+                raise
+            return
         if not self._is_verifier:
             await self.upload_dir(self.environment_dir, self._default_cwd)
             data_dir = self.environment_dir / "data"
@@ -366,7 +378,7 @@ class TaskBuilderRJobEnvironment(BaseEnvironment):
                 )
                 if link.return_code != 0:
                     raise RuntimeError(link.stderr or link.stdout or "创建 /app/inputs 输入路径失败")
-            await self._install_claude_runtime()
+            await self._install_agent_runtime()
         else:
             tests_dir = self.environment_dir if (self.environment_dir / "test.sh").is_file() else self.environment_dir.parent / "tests"
             if tests_dir.is_dir():
@@ -378,12 +390,15 @@ class TaskBuilderRJobEnvironment(BaseEnvironment):
         if data_dir.is_dir():
             self._checked_exec(f"mkdir -p /app /app/results && rm -rf /app/inputs && ln -s {shlex.quote(remote_data)} /app/inputs")
 
-    async def _install_claude_runtime(self) -> None:
-        source = resolve_claude_source()
-        await self.upload_file(source, "/usr/local/bin/claude")
-        result = self._brainctl_exec("chmod 755 /usr/local/bin/claude", timeout=60)
-        if result.return_code != 0:
-            raise RuntimeError(result.stderr or result.stdout or "安装 Claude Code 失败")
+    async def _install_agent_runtime(self) -> None:
+        from .agent_runtime import runtime_files
+        agent = os.environ.get("TASK_BUILDER_AGENT", "claude-code")
+        for source, remote in runtime_files(agent):
+            self._checked_exec(f"mkdir -p {shlex.quote(str(Path(remote).parent))}")
+            await self.upload_file(source, remote)
+            self._checked_exec(f"chmod 755 {shlex.quote(remote)}")
+        if agent not in {"nop", "oracle"}:
+            self._checked_exec(f"{'codex' if agent == 'codex' else 'claude'} --version")
 
     async def stop(self, delete: bool) -> None:
         if not self._job_name or self._submission_uncertain:
@@ -433,7 +448,8 @@ class TaskBuilderRJobEnvironment(BaseEnvironment):
 
     async def exec(self, command: str, cwd: str | None = None, env: dict[str, str] | None = None, timeout_sec: int | None = None, user: str | int | None = None) -> ExecResult:
         del user
-        return await asyncio.to_thread(self._brainctl_exec, command, cwd=cwd or self._default_cwd, env=env, timeout=float(timeout_sec or 86400) + 120)
+        combined = {**getattr(self, "_package_env", {}), **(env or {})}
+        return await asyncio.to_thread(self._brainctl_exec, command, cwd=cwd or self._default_cwd, env=combined or None, timeout=float(timeout_sec or 86400) + 120)
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         await asyncio.to_thread(self._verified_upload, Path(source_path), target_path)

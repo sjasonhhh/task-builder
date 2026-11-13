@@ -4,6 +4,8 @@ import os
 import signal
 import subprocess
 import time
+import queue
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -50,12 +52,16 @@ def task_deadline(seconds: float):
 
 
 def run_process(command, **kwargs):
+    on_stdout = kwargs.pop("on_stdout", None)
+    on_poll = kwargs.pop("on_poll", None)
     timeout = remaining_timeout(kwargs.pop("timeout"))
     kwargs.pop("check", None)
     input_text = kwargs.pop("input", None)
     if input_text is not None:
         kwargs["stdin"] = subprocess.PIPE
     process = subprocess.Popen(command, start_new_session=True, **kwargs)
+    if on_stdout is not None or on_poll is not None:
+        return _observe_process(process, command, input_text, timeout, on_stdout, on_poll)
     try:
         stdout, stderr = process.communicate(input=input_text, timeout=timeout)
     except BaseException as error:
@@ -84,4 +90,88 @@ def run_process(command, **kwargs):
             error.stdout = stdout
             error.stderr = stderr
         raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def _observe_process(process, command, input_text, timeout, on_stdout, on_poll):
+    """Drain both pipes while delivering stdout lines and checking the task deadline."""
+    messages = queue.Queue()
+    collected = {"stdout": [], "stderr": []}
+    readers = []
+
+    def read_pipe(name):
+        pipe = getattr(process, name)
+        try:
+            if pipe is not None:
+                for line in iter(pipe.readline, "" if process.text_mode else b""):
+                    messages.put((name, line))
+        finally:
+            if pipe is not None:
+                pipe.close()
+
+    def write_input():
+        try:
+            process.stdin.write(input_text)
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            process.stdin.close()
+
+    def drain():
+        while True:
+            try:
+                name, line = messages.get_nowait()
+            except queue.Empty:
+                return
+            collected[name].append(line)
+            if name == "stdout" and on_stdout:
+                on_stdout(line.decode(errors="replace") if isinstance(line, bytes) else line)
+
+    for name in collected:
+        thread = threading.Thread(target=read_pipe, args=(name,), daemon=True)
+        thread.start()
+        readers.append(thread)
+    writer = None
+    if input_text is not None:
+        writer = threading.Thread(target=write_input, daemon=True)
+        writer.start()
+    started = time.monotonic()
+    error = None
+    try:
+        while process.poll() is None or any(t.is_alive() for t in readers):
+            drain()
+            if on_poll:
+                on_poll()
+            remaining_timeout(1)
+            if time.monotonic() - started >= timeout:
+                raise subprocess.TimeoutExpired(command, timeout)
+            time.sleep(0.05)
+        drain()
+        if on_poll:
+            on_poll()
+    except BaseException as exc:
+        error = exc
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    finally:
+        process.wait()
+        for thread in readers + ([writer] if writer else []):
+            thread.join(timeout=5)
+        drain()
+    empty = "" if process.text_mode else b""
+    stdout, stderr = (empty.join(collected[name]) for name in ("stdout", "stderr"))
+    if error is not None:
+        if isinstance(error, subprocess.TimeoutExpired):
+            try:
+                remaining_timeout(1)
+            except TaskTimeout as expired:
+                error = expired
+            else:
+                error.output = stdout
+        if isinstance(error, (subprocess.TimeoutExpired, TaskTimeout)):
+            error.stdout, error.stderr = stdout, stderr
+        raise error
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)

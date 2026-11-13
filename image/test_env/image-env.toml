@@ -1,6 +1,6 @@
 [images]
-experiment = "registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting:scienv-test_env-experiment-gpu-20261014"
-evaluation = "registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting:scienv-test_env-evaluation-gpu-20261014"
+experiment = "registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting:scienv-test_env-cns-experiment-cu118-20261112-143239"
+evaluation = "registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting:scienv-test_env-cns-evaluation-cu118-20261112-173014"
 
 [hcluster]
 charged_group = "data_tools_gpu_pool"
@@ -8,7 +8,7 @@ mount = "gpfs://gpfs1/cl4mind:/mnt/shared-storage-user/cl4mind"
 namespace = "ailab-datatools"
 # 单个 RJob 的资源上限；实际申请量取自任务 task.toml 的 [environment] / [verifier.environment]
 max_cpu = 16
-max_memory_mb = 65536
+max_memory_mb = 32768
 max_agent_gpus = 1
 max_verifier_gpus = 1
 priority = 9

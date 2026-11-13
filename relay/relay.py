@@ -25,9 +25,11 @@ from urllib.request import ProxyHandler, Request, build_opener, getproxies, prox
 
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT.parent))
+from task_builder.agent_config import agent_name, codex_base_url, codex_settings, codex_config_arguments
 HEALTH_PATH = "/__relay__/health"
 PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
-AUTH_KEYS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+AUTH_KEYS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY")
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"}
 
 
@@ -192,6 +194,8 @@ class Entry:
     auth_value: str
     model: str | None
     port: int = 0
+    agent: str = "claude-code"
+    reasoning_effort: str | None = None
 
 
 def load_config(path: Path) -> tuple[dict, list[Entry]]:
@@ -234,7 +238,12 @@ def load_config(path: Path) -> tuple[dict, list[Entry]]:
         auth_value = values[item["auth_var"]]
         if "\r" in auth_value or "\n" in auth_value:
             raise RelayError(f"入口 {name} 的认证变量包含非法换行")
-        entries.append(Entry(name, env_file, upstream, item["auth_type"], auth_value, values.get(item.get("model_var", "")), port))
+        try:
+            agent = agent_name(values)
+        except ValueError as exc:
+            raise RelayError(str(exc)) from exc
+        entries.append(Entry(name, env_file, upstream, item["auth_type"], auth_value, values.get(item.get("model_var", "")), port,
+                             agent, values.get("REASONING_EFFORT")))
     timeout = config.get("timeout_sec", 3900)
     if type(timeout) is not int or timeout < 1:
         raise RelayError("timeout_sec 必须为正整数")
@@ -401,6 +410,8 @@ class APIService:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def upstream_connection(self, path: str, query: str):
+        if self.entry.agent == "codex" and self.upstream.path.rstrip("/") and path.startswith("/v1/"):
+            path = path[3:]
         target = self.upstream.path.rstrip("/") + path
         if query:
             target += "?" + query
@@ -427,7 +438,8 @@ class APIService:
         host = self.advertised_host
         if ":" in host:
             host = "[" + host + "]"
-        return {"name": self.entry.name, "env_file": str(self.entry.env_file), "base_url": f"http://{host}:{self.server.server_port}", "model": self.entry.model, "token": self.token}
+        return {"name": self.entry.name, "env_file": str(self.entry.env_file), "base_url": f"http://{host}:{self.server.server_port}", "model": self.entry.model, "token": self.token,
+                "agent": self.entry.agent, "reasoning_effort": self.entry.reasoning_effort}
 
     def start(self) -> None:
         self.thread.start()
@@ -511,21 +523,36 @@ def current_model_entry(entry: dict, config_path: Path) -> dict:
     model = values.get(model_var)
     if not model:
         raise RelayError(f"入口 {entry['name']} 的配置缺少模型变量 {model_var}")
-    return {**entry, "model": model}
+    return {**entry, "model": model, "agent": agent_name(values), "reasoning_effort": values.get("REASONING_EFFORT")}
 
 
 def proxy_environment(entry: dict, original: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if original is None else original)
     for key in PROXY_KEYS + AUTH_KEYS:
         env.pop(key, None)
-    env["ANTHROPIC_BASE_URL"] = entry["base_url"]
-    env["ANTHROPIC_AUTH_TOKEN"] = entry["token"]
-    env["ANTHROPIC_API_KEY"] = entry["token"]
+    agent = entry.get("agent") or agent_name(env)
+    if agent == "codex":
+        env.pop("ANTHROPIC_BASE_URL", None)
+        env.pop("ANTHROPIC_MODEL", None)
+        env.pop("CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT", None)
+        env["OPENAI_BASE_URL"] = codex_base_url(entry["base_url"])
+        env["OPENAI_API_KEY"] = entry["token"]
+    else:
+        env.pop("OPENAI_BASE_URL", None)
+        env["ANTHROPIC_BASE_URL"] = entry["base_url"]
+        env["ANTHROPIC_AUTH_TOKEN"] = entry["token"]
+        env["ANTHROPIC_API_KEY"] = entry["token"]
     env["RELAY_BASE_URL"] = entry["base_url"]
     env["RELAY_TOKEN"] = entry["token"]
     if entry.get("model"):
-        env["ANTHROPIC_MODEL"] = entry["model"]
-    env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
+        env["MODEL_ID"] = entry["model"]
+        if agent == "claude-code":
+            env["ANTHROPIC_MODEL"] = entry["model"]
+    if agent == "claude-code":
+        env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
+    env["AGENT"] = agent
+    if entry.get("reasoning_effort") and not env.get("REASONING_EFFORT"):
+        env["REASONING_EFFORT"] = entry["reasoning_effort"]
     host = urlsplit(entry["base_url"]).hostname
     for key in ("NO_PROXY", "no_proxy"):
         entries = [value.strip() for value in env.get(key, "").split(",") if value.strip()]
@@ -704,7 +731,10 @@ def main(argv: list[str] | None = None) -> int:
                     program[1:1] = ["--settings", json.dumps({"modelOverrides": {"claude-opus-4-8": model}}, separators=(",", ":"))]
                 if not any(argument.split("=", 1)[0] in {"--session-id", "--resume", "--continue", "-r", "-c"} for argument in program[1:]):
                     program[1:1] = ["--session-id", str(uuid.uuid4())]
-            if entry.get("api_format") == "openai":
+            if Path(program[0]).name == "codex":
+                program[1:1] = ["--model", entry["model"], *codex_config_arguments(
+                    codex_settings(env["OPENAI_BASE_URL"], env.get("REASONING_EFFORT")))]
+            if entry.get("api_format") == "openai" and Path(program[0]).name == "claude":
                 from chat_compat import run_client
                 return run_client(entry, program, env)
             os.execvpe(program[0], program, env)

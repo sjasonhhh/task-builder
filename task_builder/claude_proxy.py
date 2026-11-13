@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
 
 from .models import EnvConfig
+from .agent_config import model_connection, codex_base_url
 
 
 class ClaudeProxyError(RuntimeError):
@@ -61,6 +62,11 @@ def worker_environment_values(
     env_config: EnvConfig,
     credentials: WorkerProxyCredentials,
 ) -> dict[str, str]:
+    if env_config.agent == "codex":
+        values = {"OPENAI_BASE_URL": codex_base_url(credentials.base_url), "OPENAI_API_KEY": credentials.token}
+        if env_config.values.get("REASONING_EFFORT"):
+            values["REASONING_EFFORT"] = env_config.values["REASONING_EFFORT"]
+        return values
     values = {
         "ANTHROPIC_MODEL": credentials.model_id,
         "ANTHROPIC_BASE_URL": credentials.base_url,
@@ -120,7 +126,9 @@ class ClaudeAPIProxy:
         advertised_host: str | None = None,
         timeout_sec: int = 3600,
     ):
-        upstream = urlsplit(env_config.values["ANTHROPIC_BASE_URL"])
+        base_url, token = model_connection(env_config.values, env_config.agent)
+        upstream = urlsplit(base_url)
+        self._agent = env_config.agent
         if upstream.scheme not in {"http", "https"} or not upstream.hostname:
             raise ClaudeProxyError("ANTHROPIC_BASE_URL 必须是有效的 HTTP 或 HTTPS 地址")
         if upstream.username or upstream.password or upstream.query or upstream.fragment:
@@ -130,7 +138,9 @@ class ClaudeAPIProxy:
 
         auth_token = env_config.values.get("ANTHROPIC_AUTH_TOKEN")
         api_key = env_config.values.get("ANTHROPIC_API_KEY")
-        if auth_token:
+        if env_config.agent == "codex":
+            self._upstream_auth = ("Authorization", f"Bearer {token}")
+        elif auth_token:
             self._upstream_auth = ("Authorization", f"Bearer {auth_token}")
         elif api_key:
             self._upstream_auth = ("x-api-key", api_key)
@@ -293,7 +303,10 @@ class ClaudeAPIProxy:
                     if incoming.scheme or incoming.netloc:
                         self._error(400, "只允许转发相对路径")
                         return
-                    target = owner._upstream_path + (incoming.path or "/")
+                    incoming_path = incoming.path or "/"
+                    if owner._agent == "codex" and owner._upstream_path and incoming_path.startswith("/v1/"):
+                        incoming_path = incoming_path[3:]
+                    target = owner._upstream_path + incoming_path
                     if incoming.query:
                         target += "?" + incoming.query
                     upstream_port = owner._upstream_port or (443 if owner._upstream_scheme == "https" else 80)

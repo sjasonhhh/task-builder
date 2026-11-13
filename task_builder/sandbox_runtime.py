@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
 import posixpath
 import re
@@ -34,12 +35,29 @@ from .integrity import content_manifest, file_digest
 from .models import ConfigError
 from .paths import PROJECT_CONFIG
 
-LIFETIME_MINUTES = 240
+LIFETIME_MINUTES = 24 * 60
 RENEW_INTERVAL = 3600
 STARTUP_TIMEOUT = 3600
 RETRY_SECONDS = 900
 CHUNK_BYTES = 16 * 1024 * 1024
 CONFIG_KEYS = ("BASE_URL", "TASK_BUILDER_SANDBOX_RESOURCE", "AD_USERNAME", "AD_PASSWORD")
+
+
+def author_lifetime_minutes(task_timeout_sec: int) -> int:
+    # Cover the entire task at creation, plus preparation and result transfer.
+    # Renewal is an additional safeguard, never the only way to finish a task.
+    return max(LIFETIME_MINUTES, math.ceil(task_timeout_sec / 60) + 120)
+
+
+def verified_expiry(detail: dict, minimum: datetime) -> str:
+    value = detail.get("expiresAt")
+    try:
+        actual = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if actual.tzinfo is None or actual < minimum - timedelta(seconds=5):
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise SandboxError("平台实际到期时间未覆盖申请时长；未确认续期成功") from None
+    return actual.isoformat()
 
 
 class SandboxError(RuntimeError):
@@ -100,10 +118,12 @@ class SandboxClient:
         end = min(deadline or float("inf"), time.monotonic() + timeout + RETRY_SECONDS)
         attempt = 0
         refreshed = False
+        operation = method + " " + urllib.parse.urlsplit(url).path
+        last_reason = ""
         while True:
             remaining = end - time.monotonic()
             if remaining <= 0:
-                raise SandboxError("平台请求等待超时")
+                raise SandboxError("平台请求等待超时：" + operation + ("；" + last_reason if last_reason else ""))
             token = self._token
             request_headers = dict(headers or {})
             if authenticated:
@@ -133,6 +153,7 @@ class SandboxClient:
                 except (OSError, ValueError):
                     pass
                 exc.close()
+                last_reason = f"HTTP {status}" + (f"：{detail}" if detail else "")
                 # A successful create can be followed by an endpoint rejecting
                 # the cached login with 403. Confirm once with a fresh login;
                 # a repeated refusal still fails as an infrastructure error.
@@ -143,14 +164,15 @@ class SandboxClient:
                 if status not in {408, 429, 500, 502, 503, 504} or not retry:
                     hint = {401: "登录凭证或账号密码无效", 403: "账号或资源池权限不足"}.get(status, "平台请求失败")
                     raise SandboxError(f"{hint}（HTTP {status}）" + (f"：{detail}" if detail else ""), status) from None
-            except (urllib.error.URLError, TimeoutError, OSError):
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_reason = type(exc).__name__
                 if not retry:
                     raise SandboxError("平台请求连接中断或超时，结果尚未确认") from None
             delay = min(15 * 2 ** min(attempt, 3), 120)
             if retry_after and retry_after.isdigit():
                 delay = max(delay, int(retry_after))
             delay = min(delay, max(0, end - time.monotonic()))
-            self.progress(f"连接暂未完成，{delay:g} 秒后重试（第 {attempt + 1} 次）")
+            self.progress(f"{operation}：{last_reason}；{delay:g} 秒后重试（第 {attempt + 1} 次）")
             time.sleep(delay)
             attempt += 1
 
@@ -170,6 +192,11 @@ class SandboxClient:
 
     def runtime_detail(self, sandbox_id: str, **kwargs) -> dict:
         return self.json("GET", self.api_path("/v1/sandboxes/" + sandbox_id), **kwargs)
+
+    def renew(self, sandbox_id: str, expires: datetime, *, deadline=None) -> str:
+        self.json("POST", self.api_path(f"/api/v1/sandboxes/{sandbox_id}/renew"),
+                  {"expiresAt": expires.isoformat()}, deadline=deadline)
+        return verified_expiry(self.detail(sandbox_id, deadline=deadline), expires)
 
     def _instance_name(self, item: dict, deadline=None) -> str:
         name = (item.get("metadata") or {}).get("name") or item.get("name")
@@ -242,19 +269,70 @@ class SandboxClient:
         return self.request("GET", url + "/files/download?" + urllib.parse.urlencode({"path": remote}),
                             headers=headers, timeout=600, deadline=deadline)
 
+    def _confirmed_absent(self, sandbox_id: str, error: SandboxError, *, deadline: float) -> bool:
+        if error.status == 404:
+            return True
+        if error.status != 403:
+            return False
+        # Deleted IDs can return 403 instead of 404. Check the same account and
+        # resource's complete list; a permission error alone proves nothing.
+        seen, page = set(), 1
+        while True:
+            result = self.json("GET", self.api_path("/api/v1/personal-sandboxes", page=page, pageSize=100),
+                               deadline=deadline)
+            if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+                raise SandboxError("沙盒列表格式异常，无法确认删除")
+            items = result["items"]
+            pagination = result.get("pagination", {})
+            if not isinstance(pagination, dict):
+                raise SandboxError("沙盒列表分页信息异常，无法确认删除")
+            total = pagination.get("totalItems")
+            if total is not None and (type(total) is not int or total < 0):
+                raise SandboxError("沙盒列表总数异常，无法确认删除")
+            if any(not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]
+                   for item in items):
+                raise SandboxError("沙盒列表缺少实例 ID，无法确认删除")
+            ids = {item["id"] for item in items}
+            if sandbox_id in ids:
+                return False
+            if len(ids) != len(items) or seen.intersection(ids):
+                raise SandboxError("沙盒列表分页重复，无法确认删除")
+            seen.update(ids)
+            if total is not None:
+                if len(seen) > total or (not items and len(seen) < total):
+                    raise SandboxError("沙盒列表不完整，无法确认删除")
+                if len(seen) == total:
+                    return True
+            elif not items:
+                return True
+            page += 1
+
     def delete(self, sandbox_id: str) -> None:
         end = time.monotonic() + 900
         path = self.api_path("/api/v1/sandboxes/" + sandbox_id)
+        # This platform can return HTTP 500 when DELETE targets an expired ID.
+        # A confirmed absence is already a successful cleanup.
         try:
-            self.json("DELETE", path, deadline=end)
+            self.detail(sandbox_id, deadline=end)
+        except SandboxError as exc:
+            if self._confirmed_absent(sandbox_id, exc, deadline=end):
+                return
+            raise
+        try:
+            self.json("DELETE", path, deadline=end, retry=False)
         except SandboxError as exc:
             if exc.status != 404:
-                raise
+                try:
+                    self.detail(sandbox_id, deadline=end)
+                except SandboxError as check_error:
+                    if self._confirmed_absent(sandbox_id, check_error, deadline=end):
+                        return
+                raise exc
         while time.monotonic() < end:
             try:
                 item = self.detail(sandbox_id, deadline=end)
             except SandboxError as exc:
-                if exc.status == 404:
+                if self._confirmed_absent(sandbox_id, exc, deadline=end):
                     return
                 raise
             state = (item.get("status") or {}).get("state") or item.get("state")
@@ -332,8 +410,6 @@ class TaskBuilderSandboxEnvironment(BaseEnvironment):
     def _validate_definition(self):
         if not self.environment_dir.is_dir() or not self.task_env_config.docker_image:
             raise ValueError("沙盒运行需要已有环境目录和 docker_image")
-        if (self.task_env_config.gpus or 0) > 0:
-            raise ValueError("当前通算沙盒仅支持 CPU 任务；需要 GPU 的任务请继续使用 RJob")
 
     @property
     def _is_verifier(self):
@@ -343,7 +419,11 @@ class TaskBuilderSandboxEnvironment(BaseEnvironment):
 
     @property
     def _cwd(self):
-        return self.task_env_config.workdir or parse_dockerfile_workdir(self.environment_dir / "Dockerfile") or "/workspace"
+        if self.task_env_config.workdir:
+            return self.task_env_config.workdir
+        if getattr(self, "_package_cwd", None):
+            return self._package_cwd
+        return parse_dockerfile_workdir(self.environment_dir / "Dockerfile") or "/workspace"
 
     def _progress(self, message):
         print(f"沙盒 {self._name}：{message}", flush=True)
@@ -450,9 +530,8 @@ class TaskBuilderSandboxEnvironment(BaseEnvironment):
             while not self._renew_stop.is_set():
                 try:
                     expires = datetime.now(timezone.utc) + timedelta(minutes=LIFETIME_MINUTES)
-                    self._client.json("POST", self._client.api_path(f"/api/v1/sandboxes/{self._sandbox_id}/renew"),
-                        {"expiresAt": expires.isoformat()}, deadline=end)
-                    self._event("renewed", expires_at=expires.isoformat())
+                    confirmed = self._client.renew(self._sandbox_id, expires, deadline=end)
+                    self._event("renewed", expires_at=confirmed)
                     break
                 except Exception as exc:
                     if time.monotonic() >= end or getattr(exc, "status", None) in {400, 401, 403, 404}:
@@ -479,6 +558,17 @@ class TaskBuilderSandboxEnvironment(BaseEnvironment):
         try:
             await asyncio.shield(creator)
             await asyncio.to_thread(self._checked, "mkdir -p /workspace /tests /logs/agent /logs/verifier /logs/artifacts /state /app/results")
+            from .task_package import install_context, is_standard_package
+            if is_standard_package(self.environment_dir.parent):
+                await install_context(self, verifier=self._is_verifier)
+                if not self._is_verifier:
+                    from .agent_runtime import runtime_files
+                    agent = os.environ.get("TASK_BUILDER_AGENT", "claude-code")
+                    for source, remote in runtime_files(agent):
+                        await asyncio.to_thread(self._checked, f"mkdir -p {shlex.quote(str(Path(remote).parent))}")
+                        await self.upload_file(source, remote)
+                        await asyncio.to_thread(self._checked, f"chmod 755 {shlex.quote(remote)}")
+                return
             if self._is_verifier:
                 tests = self.environment_dir if (self.environment_dir / "test.sh").is_file() else self.environment_dir.parent / "tests"
                 if tests.is_dir():
@@ -491,8 +581,14 @@ class TaskBuilderSandboxEnvironment(BaseEnvironment):
                 await self.upload_dir(self.environment_dir, self._cwd)
                 data = self.environment_dir / "data"
                 remote_data = posixpath.join(self._cwd, "data")
-                await self.upload_file(resolve_claude_source(), "/usr/local/bin/claude")
-                await asyncio.to_thread(self._checked, "chmod 755 /usr/local/bin/claude")
+                from .agent_runtime import runtime_files
+                agent = os.environ.get("TASK_BUILDER_AGENT", "claude-code")
+                for source, remote in runtime_files(agent):
+                    await asyncio.to_thread(self._checked, f"mkdir -p {shlex.quote(str(Path(remote).parent))}")
+                    await self.upload_file(source, remote)
+                    await asyncio.to_thread(self._checked, f"chmod 755 {shlex.quote(remote)}")
+                if agent not in {"nop", "oracle"}:
+                    await asyncio.to_thread(self._checked, f"{'codex' if agent == 'codex' else 'claude'} --version")
             if data.is_dir():
                 await asyncio.to_thread(self._checked, "mkdir -p /app && rm -rf /app/inputs && ln -s " + shlex.quote(remote_data) + " /app/inputs")
         except BaseException:
@@ -557,6 +653,7 @@ class TaskBuilderSandboxEnvironment(BaseEnvironment):
 
     async def exec(self, command: str, cwd=None, env=None, timeout_sec=None, user=None):
         cancelled = threading.Event()
+        env = {**getattr(self, "_package_env", {}), **(env or {})} or None
         worker = asyncio.create_task(asyncio.to_thread(self._exec, command, cwd, env, float(timeout_sec or 86400), self._resolve_user(user), cancelled))
         try:
             return await asyncio.shield(worker)

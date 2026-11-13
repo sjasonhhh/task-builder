@@ -14,7 +14,7 @@ from .workspace import SourceWorkspace, record_event
 
 
 # solution/solve.sh 是迁移自论文结果或代码的参考提交。
-_REQUIRED_FILES = ("task.toml", "instruction.md", "README.md", "solution/solve.sh", "tests/test.sh")
+_REQUIRED_FILES = ("task.toml", "instruction.md", "README.md", "solution/solve.sh", "tests/Dockerfile")
 _MISSING_FILE_ATTEMPTS = 2
 
 
@@ -93,6 +93,15 @@ def run_writer_agent(source: SourceBundle, config: PipelineConfig, workspace: So
         environment=environment,
         source_manifest=source_manifest(workspace.input_dir),
     )
+    evidence = workspace.source_root / "previous-evidence"
+    extra_reads = (evidence,) if evidence.is_dir() else ()
+    if extra_reads:
+        prompt += (
+            f"\n本次从旧运行的中间备份恢复。先查看只读目录 {evidence} 内的旧草稿、"
+            "修改候选和审核意见，复用可用代码并解决已指出的问题。中间备份可能缺少 data/"
+            "或大文件，必须从当前输入材料补齐到本次 draft，不能把缺数据的旧草稿当成成品；"
+            "旧测试成绩不作为通过依据，后续会重新验证。不要修改备份目录。\n"
+        )
     required = _REQUIRED_FILES
     try:
         _run_until_files_written(
@@ -105,8 +114,8 @@ def run_writer_agent(source: SourceBundle, config: PipelineConfig, workspace: So
             workdir=workspace.draft_dir,
             env_config=config.author_env,
             # shared/ 的内容已全部写进提示词，不交给 agent：不在访问范围内，Claude Code 会拒绝任何写入。
-            allowed_dirs=(workspace.input_dir, workspace.plan_dir),
-            read_only_dirs=(workspace.plan_dir,),
+            allowed_dirs=(workspace.input_dir, workspace.plan_dir, *extra_reads),
+            read_only_dirs=(workspace.plan_dir, *extra_reads),
         )
     except AgentError as exc:
         if hasattr(exc, "run"):
@@ -117,7 +126,13 @@ def run_writer_agent(source: SourceBundle, config: PipelineConfig, workspace: So
 
 
 def _failure_evidence(workspace: SourceWorkspace, current_failure: str) -> str:
-    parts = ["当前失败摘要：\n" + current_failure]
+    """Keep the current failure intact; only history consumes the remaining budget."""
+    current = "当前失败摘要：\n" + current_failure
+    history_budget = max(0, 600_000 - len(current) - 2)
+    # The current failure takes priority even if it alone exceeds the budget.
+    if not history_budget:
+        return current
+    parts = []
     roots = (workspace.failures_dir, workspace.reviews_dir, workspace.validation_dir, workspace.logs_dir)
     for root in roots:
         if not root.is_dir():
@@ -130,10 +145,11 @@ def _failure_evidence(workspace: SourceWorkspace, current_failure: str) -> str:
                     text = path.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     continue
-                if len(text) > 12000:
-                    text = text[-12000:]
+                text = text[-12_000:]
                 parts.append(f"\n===== {path} =====\n{text}")
-    return "\n".join(parts)[-60000:]
+    if not parts:
+        return current
+    return current + "\n\n" + "\n".join(parts)[-history_budget:]
 
 
 def _accept_repaired_plan(candidate_plan: Path, workspace: SourceWorkspace) -> None:
@@ -149,6 +165,32 @@ def _accept_repaired_plan(candidate_plan: Path, workspace: SourceWorkspace) -> N
     shutil.copy2(old_path, workspace.failures_dir / f"plan-before-repair-{revision:03d}.json")
     old_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     record_event(workspace, "plan-repaired", revision=revision)
+
+
+def _preserve_interrupted_repair(workspace: SourceWorkspace, candidate: Path, error: BaseException) -> None:
+    recovery = workspace.source_root / "recovery"
+    recovery.mkdir(exist_ok=True)
+    target = recovery / ("interrupted-repair-" + candidate.name)
+    marker = {"status": "unreviewed", "error": str(error), "created_by": "task_builder"}
+    (candidate / "interrupted.json").write_text(json.dumps(marker, ensure_ascii=False, indent=2) + "\n")
+    candidate.rename(target)
+    pointer = recovery / "current-repair.json"
+    temporary = pointer.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"path": target.relative_to(workspace.source_root).as_posix(),
+                                     "status": "unreviewed"}) + "\n")
+    temporary.replace(pointer)
+    # Retain only our latest candidate; the accepted draft is untouched.
+    for previous in recovery.glob("interrupted-repair-*"):
+        if previous != target and previous.is_dir() and not previous.is_symlink():
+            record = previous / "interrupted.json"
+            if record.is_file():
+                try:
+                    owned = json.loads(record.read_text()).get("created_by") == "task_builder"
+                except (OSError, ValueError):
+                    owned = False
+                if owned:
+                    shutil.rmtree(previous)
+    record_event(workspace, "interrupted-repair-preserved", path=str(target), old_scores_trusted=False)
 
 
 def run_repair_writer_agent(source: SourceBundle, config: PipelineConfig, workspace: SourceWorkspace, agent: IndependentClaudeAgent, failure: str) -> Path:
@@ -187,6 +229,7 @@ def run_repair_writer_agent(source: SourceBundle, config: PipelineConfig, worksp
     )
     plan_dir = candidate_plan
     required = _REQUIRED_FILES
+    keep_candidate = False
     try:
         try:
             run = _run_until_files_written(
@@ -211,8 +254,19 @@ def run_repair_writer_agent(source: SourceBundle, config: PipelineConfig, worksp
         _check_draft(candidate_draft, stage="repair-writer", required=required)
         _accept_repaired_plan(candidate_plan, workspace)
         _replace_draft(candidate_draft, workspace.draft_dir)
+    except BaseException as exc:
+        try:
+            _preserve_interrupted_repair(workspace, candidate_root, exc)
+        except OSError as preserve_error:
+            keep_candidate = True
+            try:
+                record_event(workspace, "interrupted-repair-preserve-failed", error=str(preserve_error))
+            except OSError:
+                pass
+        raise
     finally:
-        shutil.rmtree(candidate_root, ignore_errors=True)
+        if not keep_candidate:
+            shutil.rmtree(candidate_root, ignore_errors=True)
         candidates_parent = candidate_root.parent
         if candidates_parent.exists() and not any(candidates_parent.iterdir()):
             candidates_parent.rmdir()

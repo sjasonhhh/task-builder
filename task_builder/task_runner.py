@@ -27,7 +27,7 @@ from .paths import PROJECT_HARBOR
 from .staging import finalize_harbor_task, validate_task_config
 
 
-TASK_PARTS = ("task.toml", "instruction.md", "data", "solution", "tests")
+TASK_PARTS = ("task.toml", "instruction.md", "environment", "data", "solution", "tests")
 # 答题模型看不到参考提交，评分只使用 tests；也支持不含参考提交的外部任务。
 OPTIONAL_PARTS = ("solution",)
 
@@ -79,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy-port", type=_nonnegative_int, default=0, help="转发端口，默认自动选择")
     parser.add_argument("--proxy-host", help="集群可访问的本机地址")
     parser.add_argument("--claude-bin", default="claude", help="本机 Claude Code 程序名或路径")
+    parser.add_argument("--codex-bin", default="codex", help="本机 Codex 程序名或路径")
     return parser
 
 
@@ -114,6 +115,7 @@ def runtime_config(args: argparse.Namespace) -> PipelineConfig:
         proxy_port=args.proxy_port,
         proxy_host=args.proxy_host,
         claude_bin=args.claude_bin,
+        codex_bin=args.codex_bin,
         model_relay=Path(args.model_relay).expanduser().absolute() if args.model_relay else None,
         sandbox=args.sandbox,
         extra={"managed_harbor": True, "cancel_event": threading.Event()},
@@ -224,7 +226,7 @@ def execute_task(task: SelectedTask, run_root: Path, config: PipelineConfig) -> 
         prepared = prepare_task(task, task_root / "task", config)
         for attempt in range(3):
             try:
-                result = run_harbor_agent(prepared, config, agent="claude-code", env_file=config.author_env.path, model=config.author_env.model_id, job_name="agent")
+                result = run_harbor_agent(prepared, config, agent=config.author_env.agent, env_file=config.author_env.path, model=config.author_env.model_id, job_name="agent")
                 break
             except StageFailure as error:
                 if error.stage not in {"infrastructure", "proxy"} or attempt == 2:
@@ -295,7 +297,11 @@ def run_tasks(args: argparse.Namespace) -> int:
             raise ConfigError("沙盒登录或资源池检查失败: " + _safe_error(error, config)) from None
     elif not shutil.which("rjob") or not shutil.which("brainctl"):
         raise ConfigError("缺少 rjob 或 brainctl，请先检查本机环境")
-    config.extra["claude_source"] = str(resolve_claude_source(config.claude_bin))
+    if config.author_env.agent == "codex":
+        from .agent_runtime import resolve_codex_source
+        config.extra["codex_source"] = str(resolve_codex_source(config.codex_bin))
+    else:
+        config.extra["claude_source"] = str(resolve_claude_source(config.claude_bin))
     config.output_root.mkdir(parents=True, exist_ok=True)
     run_root = config.output_root / (datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
     run_root.mkdir()

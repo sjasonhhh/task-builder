@@ -1,0 +1,13 @@
+{
+  "bind_host": "0.0.0.0",
+  "entries": [
+    {
+      "name": "codex",
+      "env_file": "../../config/codex.env",
+      "base_url_var": "OPENAI_BASE_URL",
+      "auth_var": "OPENAI_API_KEY",
+      "auth_type": "bearer",
+      "model_var": "MODEL_ID"
+    }
+  ]
+}

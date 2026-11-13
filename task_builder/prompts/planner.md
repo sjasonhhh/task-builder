@@ -29,6 +29,14 @@
 
 以上为便于阅读的组织示例，可以增加说明字段或调整结构；按科学内容组织计划，不以字段数量、枚举或路径写法判断计划是否合格。
 
+### 先清点实验和评测，再组织任务
+
+按照 rubric 的 experiment_coverage，先检查论文正文、补充材料、图表及相关代码，整理完整的实验和评测范围，再编写 problem、data_split 和 verifier_metrics。
+
+不能先选定一个方便实现的子实验，再只搜索支持这个选择的材料。
+
+上述说明保存在同一个计划文件中，组织形式不限，不新增必需文件。
+
 ### problem（从论文提取）
 
 - 真实科研问题；
@@ -55,7 +63,6 @@ cell2location 小鼠大脑 Visium 空间转录组细胞类型丰度估计（两�
 - 单张投影信噪比极低，无法直接读出取向；
 - 颗粒在冰层中的择优吸附会使取向分布不均匀，部分方向被过度采样；
 - 取向估计的偏差会直接降低三维重构在某些方向上的分辨率。
-本任务提供一份真实的单颗粒投影数据集。你需要仅根据投影图像和成像参数，推断每张图像的取向，并刻画整个数据集的取向分布。>
 输入数据：/workspace/data/particles.mrcs（已中心化的投影图像）、/workspace/data/ctf.star（每张图像的成像参数）
 请研究并解决：
 1. 取向推断：为每张投影图像给出其三维取向。
@@ -69,7 +76,7 @@ cell2location 小鼠大脑 Visium 空间转录组细胞类型丰度估计（两�
 
 ##### 差的点
 1、题目中”实现并训练上述两步贝叶斯负二项模型“直接就提示了方法、题目中绝对不能出现明显的倾向/提示；
-2、题目后半段的(1)(2)(3)直接就把方法、流程直接写上去了，而求解问题的solver几乎就直接按着流程求解即可，这样的话一个不懂该专业领域的、只会python的小白也能解决、问题就没有任何意义
+2、列出多个科学目标和评测维度本身没有问题，而且应覆盖可复现的实验。这里需要避免的是指定模型、处理步骤、参数、先验数值或参考答案；不能为了避免提示解法而删掉必要的科学目标和评测要求。
 
 #### 差的research_question_2
 给定 20 株肺炎克雷白菌的组装基因组(FASTA)、一个预训练的全基因组 MIC 面板回归模型及其特征索引文件，请构建并执行一条'基因组序列 → 各抗生素 MIC'的完整预测管线……（题目直接泄漏了方法、镜像条件和实验链路，严重不合格）
@@ -81,16 +88,21 @@ cell2location 小鼠大脑 Visium 空间转录组细胞类型丰度估计（两�
 
 ### data_split
 
-按 rubric 的 data_split 条目，在 `data_split.files` 中为来源文件清单里 {data} 下的每个文件或目录写一项 `{{"path": ..., "role": ..., "reason": ...}}`，`path` 写相对 {data} 的路径，必须与来源文件清单中的文件或目录一致，不要写绝对路径，也不要加 `input/data/`、`data/` 前缀；同类文件多时可用 `*` 通配。目录整体同一角色时写目录即可；目录内角色不同时逐个文件写。程序会核对每个路径在来源数据中真实存在，对不上的计划不会被接受。
+按 rubric 的 data_split 条目，在 `data_split.files` 中为来源文件清单里 {data} 下的每个文件或目录写一项 `{{"path": ..., "role": ..., "reason": ...}}`，`path` 写相对 {data} 的路径，必须与来源文件清单中的文件或目录一致，不要写绝对路径，也不要加 `input/data/`、`data/` 前缀；同类文件多时可用 `*` 通配。目录整体同一角色时写目录即可；目录内角色不同时逐个文件写。计划补充的公开数据单独说明来源和用途，现有输入文件仍按实际路径记录。
 
 data_split 是给 Writer 的划分建议，Writer 据此准备任务 data/。需要改名、去掉来源目录层级、拆分或转换格式时，在 `data_split` 中另写 `notes` 说明。
 
-### verifier_metrics（从论文评估部分提取）
+### verifier_metrics（从完整实验清单提取）
 
-按 rubric 的 metric_provenance 与 scoring 条目，先写 `experiments`，再写 `metrics`：
-- `experiments`：每项 `{{"name": ..., "tier": "primary" 或 "secondary", "reason": ...}}`；
-- `metrics`：每项含 name、source、definition、paper_value、paper_interval、dataset、experiment、direction、starter、bound、sota；sota 写成对象 `{{"value": 数值, "derivation": "计算过程"}}`；
-- `source` 写 `text.md` 中的章节标题，或 `figures/`、`tables/` 中的文件名；`dataset` 写该指标在 {data} 中对应的文件或子集。
+依据 rubric 的 experiment_coverage、metric_provenance 和 scoring，为全部纳入的实验提取评测指标。
+
+- experiments：说明实验名称、验证的科学问题、数据与条件以及原文出处。
+- metrics：逐项记录 name、source、definition、paper_value、paper_interval、dataset、code_ref、experiment、direction、starter、bound、sota；字段含义沿用 rubric。
+- 不同实验、数据集或条件使用同名指标时，明确各自对应关系，不能只保留其中一个实例。
+- 对没有纳入的评测手段说明原因和证据，不能在提取时直接省略。
+- 写明每项指标对应的提交内容和评测所需材料。不要默认把全部输入数据复制给评测器。
+
+计划格式保持灵活，但实验、评测方法、指标、数据和提交内容之间的关系必须清楚。
 
 此外可写：输出字段与指标的对应关系、格式与完整性检查、空操作和伪造输出的拒绝方式。每条非计分检查必须写明依据类别（题面输出契约、客观数学/数据事实、论文或原始代码）及证据位置；没有客观依据的经验阈值不得规划为 verifier 检查。
 

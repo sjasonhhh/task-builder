@@ -9,7 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import shutil
 from pathlib import Path
 
-from .agents import IndependentClaudeAgent
+from .agents import IndependentClaudeAgent, create_agent
 from .discovery import discover_sources, read_run_names
 from .harbor_runtime import validate_with_harbor
 from .models import AgentError, PipelineConfig, SourceBundle, StageFailure, TaskTimeout, ValidationIssue, ValidationReport
@@ -26,7 +26,10 @@ from .human_review import (begin_attempt, finish_attempt, publish_staged, record
                            request_for, restore_for_review, select_sources)
 
 def is_complete_published_task(path: Path) -> bool:
-    return path.is_dir() and not _missing_files(path)
+    required = ("task.toml", "instruction.md", "README.md", "solution/solve.sh")
+    return (path.is_dir() and not _missing_files(path, required)
+            and ((path / "tests/test.sh").is_file()
+                 or ((path / "tests/Dockerfile").is_file() and (path / "environment/Dockerfile").is_file())))
 
 
 def published_source_slugs(output_root: Path) -> set[str]:
@@ -176,7 +179,7 @@ def _process_source_work(source: SourceBundle, config: PipelineConfig, run_root:
     shared_dir = run_root / "workspace" / "shared"
     workspace = create_source_workspace(run_root, shared_dir, source)
     record_event(workspace, "source-started", source=str(source.source_dir), slug=source.source_slug)
-    agent = IndependentClaudeAgent(claude_bin=config.claude_bin, timeout_sec=config.agent_timeout_sec)
+    agent = create_agent(config)
     human_request = request_for(config, source.source_slug)
     if human_request:
         restore_for_review(source, config, workspace)

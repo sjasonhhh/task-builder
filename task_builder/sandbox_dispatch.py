@@ -22,10 +22,15 @@ from .cli import _positive_int
 from .config import build_config, tomllib
 from .models import ConfigError, PipelineConfig, PipelineError, StageFailure
 from .paths import PROJECT_ROOT, PROJECT_PRICING
-from .sandbox_runtime import SandboxClient, SandboxError, sandbox_settings
+from .sandbox_runtime import SandboxClient, SandboxError, sandbox_settings, author_lifetime_minutes
 from .sandbox_session import AuthoringSandbox
 from .sandbox_transfer import checked, download_archive, upload_tree
 from .sandbox_worker import ROOT, PRIVATE
+
+DEFAULT_TASK_BUILDER_IMAGE = (
+    "registry.h.pjlab.org.cn/ailab-datatools-data_tools_gpu_pool/shaoyuting"
+    "@sha256:9871a689fce9c97bb114ac06c065c45f1d8954a62d60a45343d2ebb51e7b52b0"
+)
 
 POLL_SECONDS = 10
 CHECKPOINT_SECONDS = 300
@@ -80,12 +85,13 @@ with ZipFile(sys.argv[1]) as archive:
 def build_parser():
     parser = argparse.ArgumentParser(description="每篇论文使用独立沙盒造任务", allow_abbrev=False)
     for name, help_text in (
-        ("sci-env", "领域名；读取对应 image-env.toml 的镜像、CPU 和内存"),
+        ("sci-env", "领域名；读取对应 image-env.toml 的实验、评测镜像、CPU 和内存"),
         ("input", "论文材料根目录"), ("output", "结果根目录"),
         ("author-env", "直连模型配置文件，如 dpinfer.env 或 free-router.env"),
     ):
         parser.add_argument("--" + name, required=True, help=help_text)
-    parser.add_argument("--image", help="只覆盖造任务主沙盒镜像；默认使用实验镜像")
+    parser.add_argument("--task-builder-image", help="只更换造题沙盒镜像；所有领域默认使用固定造题镜像，与实验、评测镜像无关")
+    parser.add_argument("--codex-bin", default="codex", help="待传送到造题沙盒的本机 Codex 程序")
     parser.add_argument("--image-env")
     parser.add_argument("--environment-root")
     parser.add_argument("--experiment-image")
@@ -104,7 +110,11 @@ def build_parser():
 
 def dispatch_config(values):
     values = dict(values)
-    image = values.pop("image", None)
+    image = values.pop("task_builder_image", None)
+    if image is not None:
+        image = image.strip()
+        if not image:
+            raise ConfigError("--task-builder-image 不能为空")
     values.pop("dry_run", None)
     values["input_root"] = values.pop("input")
     values["output_root"] = values.pop("output")
@@ -114,7 +124,7 @@ def dispatch_config(values):
         value = table.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ConfigError(f"造任务沙盒要求 image-env.toml 明确填写 [hcluster].{key}")
-    config.extra.update(sandbox_dispatch=True, sandbox_author_image=image or config.experiment_image)
+    config.extra.update(sandbox_dispatch=True, sandbox_author_image=image if image is not None else DEFAULT_TASK_BUILDER_IMAGE)
     return config
 
 
@@ -131,7 +141,7 @@ def _entries_and_job(source, config, run_root, sandbox_id):
     values.update(input_root=str(ROOT / "inputs" / config.sci_env), output_root=str(remote_output),
                   environment_dir=str(remote_env), image_env_path=str(remote_env / "image-env.toml"),
                   rubric_path=str(ROOT / "config/rubric.md"), run_txt=None, resume_from=None,
-                  concurrency=1, model_relay=None, claude_bin="claude", extra={})
+                  concurrency=1, model_relay=None, claude_bin="claude", codex_bin="codex", extra={})
     # Only this paper's human feedback travels to its sandbox.
     for key in ("human_review_requests", "publication_expected"):
         if source.source_slug in config.extra.get(key, {}):
@@ -165,7 +175,8 @@ def _entries_and_job(source, config, run_root, sandbox_id):
         old = previous / "workspace/sources" / source.source_slug
         if old.is_dir():
             for path in sorted(old.iterdir()):
-                if path.name in {"plan", "draft", "logs", "reviews", "failures", "previous-evidence"}:
+                if path.name in {"plan", "draft", "logs", "reviews", "failures", "previous-evidence",
+                                 "recovery", ".repair-candidates", ".artifact-export.json", ".history-files.json"}:
                     entries.append((path, f"output/{config.sci_env}/runs/{previous.name}/workspace/sources/{source.source_slug}/{path.name}"))
             for path in sorted((old / "validation").rglob("*")):
                 if path.is_file() and "data" not in path.relative_to(old / "validation").parts and path.suffix in {".json", ".log", ".txt", ".jsonl"}:
@@ -182,7 +193,8 @@ def _env_bytes(values):
 def _prepare(session, source, config, run_root):
     entries, job = _entries_and_job(source, config, run_root, session.id)
     session.save(phase="uploading", remote_run=job["run_root"])
-    upload_tree(session.client, session.id, entries, str(ROOT), session.cancelled)
+    transfer = upload_tree(session.client, session.id, entries, str(ROOT), session.cancelled)
+    session.save(last_upload=transfer)
     session.check()
     session.command(f"mkdir -p {PRIVATE} && chmod 700 {PRIVATE}")
     settings = sandbox_settings()
@@ -194,14 +206,25 @@ def _prepare(session, source, config, run_root):
                        ("model.env", _env_bytes(model_values))):
         session.client.upload(session.id, data, str(PRIVATE / name))
     session.command(f"chmod 600 {PRIVATE}/*")
+    agent = config.author_env.agent
+    if agent == "codex":
+        from .agent_runtime import runtime_files
+        files = runtime_files(agent, config.codex_bin)
+        upload_tree(session.client, session.id, [(source_path, str(Path(destination).relative_to('/usr/local'))) for source_path, destination in files],
+                    "/usr/local", session.cancelled)
+        for source_path, destination in files:
+            session.command(f"chmod 755 {shlex.quote(destination)}")
+        from .codex_sandbox import ensure_codex_sandbox
+        ensure_codex_sandbox(session, PRIVATE)
+    program = "codex" if agent == "codex" else "claude"
     # Reuse the prepared image. Never install or build scientific software locally.
     # Linking first makes setup_env fail rather than silently install dependencies.
     try:
         session.command(f"test -x /opt/orch/venv/bin/python && test -x /opt/orch/venv/bin/harbor && "
-                        f"command -v claude >/dev/null && command -v setsid >/dev/null && "
+                        f"{program} --version >/dev/null && command -v setsid >/dev/null && "
                         f"ln -s /opt/orch/venv {ROOT}/.venv && cd {ROOT} && bash setup_env.sh")
     except SandboxError:
-        raise SandboxError("造任务镜像缺少可用的 Claude 或 /opt/orch/venv（Python 3.12、Harbor 及项目补丁）；请用 --image 指定已准备好的镜像") from None
+        raise SandboxError(f"造任务镜像缺少可用的 {program} 或 /opt/orch/venv（Python 3.12、Harbor 及项目补丁）；请用 --task-builder-image 指定已准备好的镜像") from None
     session.save(phase="checking-dependencies")
     try:
         _prepare_helper(session)
@@ -266,7 +289,7 @@ for sig in (signal.SIGTERM,signal.SIGKILL):
     session.command(f"{PYTHON} -c {shlex.quote(script)} {PRIVATE}/pid {shlex.quote(session.id)}")
 
 
-def _export(session, run_root, slug, *, checkpoint=False):
+def _export(session, run_root, slug, *, checkpoint=False, config=None):
     remote = "/tmp/tb-export-" + uuid.uuid4().hex
     flag = " --checkpoint" if checkpoint else ""
     # Export may exceed one gateway request; run it once, then poll a small marker.
@@ -280,7 +303,26 @@ def _export(session, run_root, slug, *, checkpoint=False):
             status = session.command(f"if test -f {remote}/done; then cat {remote}/done; else echo pending; fi").strip()
             if status != "pending":
                 if status != "0":
-                    raise SandboxError("结果打包失败，主沙盒保留等待恢复")
+                    # Keep the real failure before finally removes the temporary
+                    # export directory; otherwise every failure looks identical.
+                    detail = ""
+                    try:
+                        log = session.client.download(session.id, remote + "/export.log").decode("utf-8", errors="replace")
+                        if config is not None:
+                            from .model_relay import redact_model_secrets
+                            log = redact_model_secrets(log, config)
+                        for name in ("_username", "_password", "_token"):
+                            secret = getattr(session.client, name, "")
+                            if secret:
+                                log = log.replace(secret, "<redacted>")
+                        if config is not None:
+                            records = run_root / "sandbox-workers" / slug
+                            records.mkdir(parents=True, exist_ok=True)
+                            (records / "export-error.log").write_text(log, encoding="utf-8")
+                            detail = log.strip().splitlines()[-1] if log.strip() else ""
+                    except (OSError, SandboxError):
+                        pass
+                    raise SandboxError("结果打包失败，主沙盒保留等待恢复" + (f"：{detail}" if detail else ""))
                 break
             time.sleep(2)
         else:
@@ -293,7 +335,7 @@ def _export(session, run_root, slug, *, checkpoint=False):
         destination.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".sandbox-result-", dir=run_root) as temp:
             extracted = Path(temp) / "contents"
-            download_archive(session.client, session.id, remote, extracted, allowed=allowed)
+            transfer = download_archive(session.client, session.id, remote, extracted, allowed=allowed)
             for name in ("workspace/sources/" + slug, "published/" + slug):
                 path = extracted / name
                 if path.is_dir():
@@ -309,7 +351,7 @@ def _export(session, run_root, slug, *, checkpoint=False):
                 if path.is_file():
                     path.replace(records / name)
         session.save(last_checkpoint=time.time() if checkpoint else session.state.get("last_checkpoint"),
-                     artifacts_received=not checkpoint)
+                     artifacts_received=not checkpoint, last_download=transfer)
     finally:
         try:
             session.command(f"rm -rf {remote}")
@@ -321,6 +363,8 @@ def _dispatch_one(source, config, run_root, cancelled):
     session = AuthoringSandbox(config, run_root, source.source_slug, cancelled)
     launched, received = False, False
     error = None
+    transfer_error = None
+    transfer_stage = "stop-worker"
     try:
         session.start()
         _prepare(session, source, config, run_root)
@@ -338,34 +382,47 @@ def _dispatch_one(source, config, run_root, cancelled):
                 raise SandboxError("造任务达到本篇论文的时间上限")
             if time.monotonic() >= checkpoint_at:
                 try:
-                    _export(session, run_root, source.source_slug, checkpoint=True)
-                except Exception:
-                    session.save(checkpoint_failed=True)
+                    _export(session, run_root, source.source_slug, checkpoint=True, config=config)
+                except Exception as exc:
+                    session.save(checkpoint_failed=True, checkpoint_error=str(exc))
                 checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
                 print(f"{source.source_slug}：造任务沙盒仍在运行，状态记录在 {session.path}", flush=True)
             cancelled.wait(POLL_SECONDS)
     except BaseException as exc:
         error = exc
+        session.save(dispatch_error={"type": type(exc).__name__, "message": str(exc)})
     finally:
         if launched:
             try:
                 _stop(session)
+                transfer_stage = "export-artifacts"
                 # Retry final transfer while the only remote copy still exists.
                 for attempt in range(3):
                     try:
-                        _export(session, run_root, source.source_slug)
+                        _export(session, run_root, source.source_slug, config=config)
                         received = True
                         break
                     except Exception:
                         if attempt == 2:
                             raise
                         time.sleep(5)
-            except Exception:
-                error = SandboxError("结果尚未完整回传，已保留主沙盒；恢复时使用 --resume-from " + str(run_root))
+            except Exception as exc:
+                transfer_error = exc
+                session.save(transfer_error={"stage": transfer_stage, "type": type(exc).__name__, "message": str(exc)})
         try:
             session.close(retain=launched and not received)
         except Exception as exc:
+            session.save(cleanup_error=str(exc))
             error = error or exc
+    if transfer_error:
+        if session.state.get("phase") == "missing":
+            recovery = "平台已无可用主沙盒，只能复用本地备份"
+        elif session.state.get("retained"):
+            recovery = "已确认主沙盒仍在，保留等待恢复"
+        else:
+            recovery = "主沙盒是否保留尚未确认，请查看状态记录"
+        reason = f"；最初错误：{error}" if error else ""
+        raise SandboxError(f"结果回传未完成：{transfer_error}{reason}；{recovery}；恢复时使用 --resume-from {run_root}") from transfer_error
     if error:
         raise error
     result_path = run_root / "sandbox-workers" / source.source_slug / "worker-result.json"
@@ -424,8 +481,16 @@ def recover_retained(config):
     previous = config.resume_from
     if previous is None:
         return
+    selected = None
+    if config.run_txt:
+        from .discovery import discover_sources, read_run_names
+        names = set(read_run_names(config.run_txt))
+        selected = {source.source_slug for source in discover_sources(config.input_root, validate=False)
+                    if source.source_dir.name in names}
     for path in sorted((previous / "sandbox-workers").glob("*.json")):
         state = json.loads(path.read_text())
+        if selected is not None and state.get("source") not in selected:
+            continue
         if state.get("phase") == "deleted":
             continue
         client = SandboxClient()
@@ -458,7 +523,10 @@ def recover_retained(config):
                 # Checkpoints omit large data. Reuse their plan and evidence, but
                 # make the writer rebuild a complete draft before validation.
                 for item in checkpoint.iterdir():
-                    dest = target / item.name if item.name != "draft" else target / "previous-evidence/checkpoint-draft"
+                    if item.name in {"draft", ".repair-candidates"}:
+                        dest = target / "previous-evidence" / ("checkpoint-" + item.name.lstrip("."))
+                    else:
+                        dest = target / item.name
                     if item.is_dir():
                         shutil.copytree(item, dest, dirs_exist_ok=True)
             session.close()
@@ -470,22 +538,29 @@ def recover_retained(config):
         session.renew_once()
         try:
             _stop(session)
-            _export(session, previous, slug)
-        except Exception:
+            _export(session, previous, slug, config=config)
+        except Exception as exc:
+            session.save(transfer_error={"type": type(exc).__name__, "message": str(exc)})
             session.close(retain=True)
-            raise SandboxError("旧沙盒结果尚未恢复，未开始新的造任务；记录: " + str(path)) from None
+            raise SandboxError(f"旧沙盒结果尚未恢复：{exc}；未开始新的造任务；记录: {path}") from exc
         session.close()
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if any(arg == "--image" or arg.startswith("--image=") for arg in argv):
+        parser.error("--image 已移除；请使用 --task-builder-image 指定造题镜像")
+    args = parser.parse_args(argv)
     try:
         config = dispatch_config(vars(args))
         if args.dry_run:
             print(json.dumps({"author_image": config.extra["sandbox_author_image"],
                               "experiment_image": config.experiment_image, "evaluation_image": config.evaluation_image,
                               "cpu": config.cpu, "memory_mb": config.memory_mb,
-                              "concurrency": config.concurrency, "models": "direct", "backend": "sandbox"},
+                              "concurrency": config.concurrency, "models": "direct", "backend": "sandbox",
+                              "task_timeout_sec": config.task_timeout_sec,
+                              "author_lifecycle_minutes": author_lifetime_minutes(config.task_timeout_sec)},
                              ensure_ascii=False, indent=2))
             return 0
         recover_retained(config)

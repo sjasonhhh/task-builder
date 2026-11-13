@@ -11,7 +11,8 @@ from pathlib import Path
 
 from .config import environment_for_subprocess
 from .models import AgentError, EnvConfig, TaskTimeout
-from .deadline import has_deadline, remaining_timeout, run_process
+from .deadline import remaining_timeout, run_process
+from .usage_capture import UsageCapture
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,14 @@ class AgentRun:
     returncode: int
     command: tuple[str, ...]
     usage: dict | None = None
+    events: str = ""
+
+
+def create_agent(config):
+    if config.author_env.agent == "codex":
+        from .codex_agent import IndependentCodexAgent
+        return IndependentCodexAgent(codex_bin=config.codex_bin, timeout_sec=config.agent_timeout_sec)
+    return IndependentClaudeAgent(claude_bin=config.claude_bin, timeout_sec=config.agent_timeout_sec)
 
 
 # 单次模型请求超时与重试次数（Claude Code 环境变量）：上游卡住时尽快放弃并重试，不叠加成数小时等待。
@@ -39,7 +48,16 @@ def parse_print_json(text: str) -> tuple[str, dict | None]:
     try:
         payload = json.loads(stripped)
     except ValueError:
-        return text, None
+        for line in reversed(stripped.splitlines()):
+            try:
+                candidate = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(candidate, dict) and candidate.get("type") == "result":
+                payload = candidate
+                break
+        else:
+            return text, None
     if not isinstance(payload, dict) or payload.get("type") != "result":
         return text, None
     raw = payload.get("usage") or {}
@@ -129,7 +147,9 @@ class IndependentClaudeAgent:
             self.claude_bin,
             "--print",
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--model",
             selected_model,
             "--resume" if resume_session else "--session-id",
@@ -143,7 +163,7 @@ class IndependentClaudeAgent:
         if role.startswith("planner"):
             prompt += "\n立即完成并保存 plan.json；论文正文读 context/text.md，图表按需读 context/figures/ 与 context/tables/。不得遍历全部数据文件；根据论文评估章节和必要源码完成计划。"
         elif not reviewer_only:
-            prompt += "\n立即创建并保存五个必需文件，先 Read plan.json，再用 Write。论文正文读 context/text.md；不要重复阅读数据预览。禁止执行科研计算和生成答案结果；只写可以后续运行的程序。"
+            prompt += "\n先 Read plan.json，再用 Write 保存本阶段文件；必需内容遵循 rubric。论文正文读 context/text.md；不要重复阅读数据预览。禁止执行科研计算和生成答案结果；只写可以后续运行的程序。"
         if writes_data:
             prompt += "\n使用 Bash 时每次只执行一条命令，不要用 &&、;、| 连接多条命令。数据文件用 cp 复制、mv 改名；修改数据时生成新文件，不要原地改写来源文件。文本数据可用 Read 分段预览；压缩或二进制数据用 zcat 或 python3 等现有工具有限预览，不进行科研计算。"
         settings = dict(model_settings)
@@ -243,63 +263,68 @@ class IndependentClaudeAgent:
         )
         environment.setdefault("API_TIMEOUT_MS", _API_TIMEOUT_MS)
         environment.setdefault("CLAUDE_CODE_MAX_RETRIES", _API_MAX_RETRIES)
-        usage_total: dict | None = None
-        try:
-            execute = run_process if has_deadline() else subprocess.run
-            for attempt in range(3):
-                completed = execute(
-                    list(command),
-                    cwd=workdir,
-                    env=environment,
-                    input=prompt,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=remaining_timeout(self.timeout_sec),
-                    check=False,
+        captured = []
+        call_id = str(uuid.uuid4())
+
+        def combined_usage():
+            if not captured:
+                return None
+            return {
+                **captured[-1],
+                **{key: sum(int(row.get(key) or 0) for row in captured)
+                   for key in _USAGE_TOKEN_KEYS + ("num_turns", "duration_ms")},
+                "captured_invocations": [row["invocation_id"] for row in captured],
+                "usage_complete": all(row["usage_complete"] for row in captured),
+            }
+
+        for attempt in range(3):
+            capture = UsageCapture(workdir, role=role, model=env_config.model_id, agent="claude",
+                                   session_id=session_id, resumed=bool(resume_session), agent_call_id=call_id,
+                                   base_url=env_config.values.get("ANTHROPIC_BASE_URL", ""))
+            try:
+                completed = run_process(
+                    list(command), cwd=workdir, env=environment, input=prompt, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=remaining_timeout(self.timeout_sec), check=False, on_stdout=capture.claude_line,
                 )
-                output_text, usage = parse_print_json(completed.stdout or "")
-                if usage:
-                    usage["model"] = env_config.model_id
-                    # 重试前失败的尝试同样消耗 token，累计到本次调用。
-                    usage_total = usage if usage_total is None else {
-                        key: (usage_total.get(key, 0) + value if isinstance(value, int) and not isinstance(value, bool) else value)
-                        for key, value in usage.items()
-                    }
-                error_text = (completed.stderr or "") + "\n" + output_text
-                connection_failure = any(marker in error_text.lower() for marker in ("apiconnectionerror", "apitimeouterror", "econnreset", "econnrefused", "上游连接失败", "api error: 502", "api error: 503", "api error: 504", "api error: 429", "unable to connect to api", "connection error", "request timed out"))
-                if completed.returncode == 0 or not connection_failure or attempt == 2:
-                    break
-                time.sleep(remaining_timeout((5, 15)[attempt]))
-                if resume_session:
-                    continue
+                capture.replay(completed.stdout or "")
+                output_text, _ = parse_print_json(completed.stdout or "")
+                captured.append(capture.finish(status="completed" if completed.returncode == 0 else "failed",
+                                               returncode=completed.returncode))
+            except (TaskTimeout, subprocess.TimeoutExpired) as exc:
+                output = safe_output(getattr(exc, "stdout", None) or "")
+                errors = safe_output(getattr(exc, "stderr", None) or "")
+                capture.replay(output)
+                captured.append(capture.finish(status="timeout"))
+                result = AgentRun(role, session_id, output, errors, -1, command, combined_usage())
+                if isinstance(exc, TaskTimeout):
+                    exc.stdout, exc.stderr, exc.run = output, errors, result
+                    raise
+                failure = AgentError(f"{role} agent 超时（{self.timeout_sec} 秒）", stage=role)
+                failure.run = result
+                raise failure from exc
+            except FileNotFoundError as exc:
+                capture.finish(status="launch_failed")
+                raise AgentError(f"找不到 Claude Code: {self.claude_bin}", stage=role) from exc
+            except BaseException:
+                capture.finish(status="interrupted")
+                raise
+            error_text = (completed.stderr or "") + "\n" + output_text
+            connection_failure = any(marker in error_text.lower() for marker in (
+                "apiconnectionerror", "apitimeouterror", "econnreset", "econnrefused", "上游连接失败",
+                "api error: 502", "api error: 503", "api error: 504", "api error: 429", "unable to connect to api",
+                "connection error", "request timed out"))
+            if completed.returncode == 0 or not connection_failure or attempt == 2:
+                break
+            time.sleep(remaining_timeout((5, 15)[attempt]))
+            if not resume_session:
                 session_id = str(uuid.uuid4())
                 retry_command = list(command)
                 retry_command[retry_command.index("--session-id") + 1] = session_id
                 command = tuple(retry_command)
-        except TaskTimeout as exc:
-            for field in ("stdout", "stderr"):
-                if getattr(exc, field, None):
-                    setattr(exc, field, safe_output(getattr(exc, field)))
-            raise
-        except FileNotFoundError as exc:
-            raise AgentError(f"找不到 Claude Code: {self.claude_bin}", stage=role) from exc
-        except subprocess.TimeoutExpired as exc:
-            output = exc.stdout or b""
-            errors = exc.stderr or b""
-            result = AgentRun(role, session_id, safe_output(output), safe_output(errors), -1, command, usage_total)
-            failure = AgentError(f"{role} agent 超时（{self.timeout_sec} 秒）", stage=role)
-            failure.run = result
-            raise failure from exc
-        result = AgentRun(
-            role=role,
-            session_id=session_id,
-            stdout=safe_output(output_text),
-            stderr=safe_output(completed.stderr),
-            returncode=completed.returncode,
-            command=command,
-            usage=usage_total,
-        )
+        result = AgentRun(role=role, session_id=session_id, stdout=safe_output(output_text),
+                          stderr=safe_output(completed.stderr or ""), returncode=completed.returncode,
+                          command=command, usage=combined_usage())
         if completed.returncode != 0:
             message = result.stderr.strip() or result.stdout.strip() or f"退出码 {completed.returncode}"
             failure = AgentError(f"{role} agent 失败: {message}", stage=role)
@@ -375,3 +400,5 @@ def save_agent_log(path: Path, run: AgentRun) -> None:
     )
     # 每次 agent 调用恰好保存一次日志，用量随日志一起记到同目录的 usage.jsonl。
     record_usage(path.parent / "usage.jsonl", run)
+    if run.events:
+        path.with_suffix(".events.jsonl").write_text(run.events, encoding="utf-8")

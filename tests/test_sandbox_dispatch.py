@@ -60,18 +60,84 @@ def test_cli_routes_images_and_resources(config, monkeypatch):
     args = dispatch.build_parser().parse_args([
         "--sci-env", "chemistry", "--input", str(config.input_root.parent),
         "--output", str(config.output_root.parent), "--author-env", str(config.author_env.path),
-        "--environment-root", str(config.environment_dir.parent), "--image", "main-only",
+        "--environment-root", str(config.environment_dir.parent), "--task-builder-image", "main-only",
     ])
     actual = dispatch.dispatch_config(vars(args))
     assert (actual.cpu, actual.memory_mb) == (16, 65536)
     assert actual.extra["sandbox_author_image"] == "main-only"
     assert actual.experiment_image == config.experiment_image
     assert actual.evaluation_image == config.evaluation_image
-    args.image = None
-    assert dispatch.dispatch_config(vars(args)).extra["sandbox_author_image"] == config.experiment_image
+    args.task_builder_image = None
+    assert dispatch.dispatch_config(vars(args)).extra["sandbox_author_image"] == dispatch.DEFAULT_TASK_BUILDER_IMAGE
     config.image_env_path.write_text(config.image_env_path.read_text().replace("max_cpu = 16\n", ""))
     with pytest.raises(ValueError, match="max_cpu"):
         dispatch.dispatch_config(vars(args))
+
+
+@pytest.mark.parametrize("sci_env", ["chemistry", "single-cell", "test_env"])
+@pytest.mark.parametrize("override", [False, True])
+def test_default_author_image_is_independent_of_domain_and_runtime_images(config, monkeypatch, sci_env, override):
+    monkeypatch.setattr("task_builder.sandbox_runtime.sandbox_settings", lambda: {})
+    environment = config.environment_dir.parent / sci_env
+    environment.mkdir(exist_ok=True)
+    experiment, evaluation = f"{sci_env}-experiment", f"{sci_env}-evaluation"
+    text = config.image_env_path.read_text().replace(config.experiment_image, experiment).replace(config.evaluation_image, evaluation)
+    (environment / "image-env.toml").write_text(text)
+    argv = ["--sci-env", sci_env, "--input", str(config.input_root.parent),
+            "--output", str(config.output_root.parent), "--author-env", str(config.author_env.path),
+            "--environment-root", str(config.environment_dir.parent)]
+    if override:
+        experiment, evaluation = "override-experiment", "override-evaluation"
+        argv += ["--experiment-image", experiment, "--evaluation-image", evaluation]
+    actual = dispatch.dispatch_config(vars(dispatch.build_parser().parse_args(argv)))
+    assert actual.extra["sandbox_author_image"] == dispatch.DEFAULT_TASK_BUILDER_IMAGE
+    assert (actual.experiment_image, actual.evaluation_image) == (experiment, evaluation)
+
+
+@pytest.mark.parametrize("image", [None, "other-author-image"])
+def test_dry_run_reports_three_images_without_starting_tasks(config, monkeypatch, capsys, image):
+    monkeypatch.setattr("task_builder.sandbox_runtime.sandbox_settings", lambda: {})
+    def unexpected(*args, **kwargs):
+        pytest.fail("dry-run must not create sandboxes or run tasks")
+    monkeypatch.setattr(dispatch, "recover_retained", unexpected)
+    monkeypatch.setattr(AuthoringSandbox, "start", unexpected)
+    monkeypatch.setattr("task_builder.pipeline.run_pipeline", unexpected)
+    argv = ["--sci-env", "chemistry", "--input", str(config.input_root.parent),
+            "--output", str(config.output_root.parent), "--author-env", str(config.author_env.path),
+            "--environment-root", str(config.environment_dir.parent), "--dry-run"]
+    if image is not None:
+        argv += ["--task-builder-image", image]
+    assert dispatch.main(argv) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["author_image"] == (image or dispatch.DEFAULT_TASK_BUILDER_IMAGE)
+    assert result["experiment_image"] == config.experiment_image
+    assert result["evaluation_image"] == config.evaluation_image
+    assert not config.output_root.exists()
+
+
+@pytest.mark.parametrize("old_args", [["--image", "old-image"], ["--image=old-image"]])
+def test_removed_image_flag_names_replacement(old_args, capsys):
+    with pytest.raises(SystemExit) as exc:
+        dispatch.main(old_args)
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "--image 已移除" in error and "--task-builder-image" in error
+
+
+def test_help_shows_only_new_author_image_flag():
+    parser = dispatch.build_parser()
+    assert "--task-builder-image" in parser.format_help()
+    assert "--image" not in parser._option_string_actions
+
+
+@pytest.mark.parametrize("image_args", [["--task-builder-image", "author"], ["--task-builder-image=author"]])
+def test_local_cli_explains_remote_authoring_entry(image_args, capsys):
+    from task_builder import cli
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--sandbox", *image_args])
+    assert exc.value.code == 2
+    assert "bash run_sandbox.sh --task-builder-image" in capsys.readouterr().err
+    assert "造题程序在当前机器运行" in cli.build_parser().format_help()
 
 
 @pytest.mark.parametrize("flag", ["--sandbox-cpu", "--sandbox-memory-mb", "--cpu", "--memory-mb", "--model-relay", "--proxy-host"])
@@ -283,6 +349,9 @@ def test_renew_and_cleanup_only_owned_children(config, tmp_path, monkeypatch):
             calls.append((method, path, body))
         def api_path(self, path):
             return path
+        def renew(self, sid, expires, **kwargs):
+            calls.append(("POST", f"/{sid}/renew", {"expiresAt": expires.isoformat()}))
+            return expires.isoformat()
         def children(self, parent):
             assert parent == "parent"
             return [{"id": "owned-child"}]
@@ -427,3 +496,259 @@ def test_status_poll_survives_one_502_without_relaunch(monkeypatch):
     assert requests[0].data == requests[1].data
     assert all(request.full_url.endswith("/command") for request in requests)
     assert b"launch.sh" not in requests[0].data
+
+
+def test_seven_hour_task_requests_full_lifetime_and_checks_platform(config, tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from task_builder import sandbox_session
+    config.task_timeout_sec = 25200
+    class Client:
+        base_url, resource = "http://platform", "pool"
+        def json(self, method, path, payload, **kwargs):
+            assert payload['lifecycleMinutes'] == 1440
+            self.expires = datetime.now(timezone.utc) + timedelta(minutes=payload['lifecycleMinutes'])
+            return {'id':'parent'}
+        def detail(self, sid, **kwargs):
+            return {'status':{'state':'Running'}, 'expiresAt':self.expires.isoformat()}
+    monkeypatch.setattr(sandbox_session, 'SandboxClient', Client)
+    monkeypatch.setattr(AuthoringSandbox, 'command', lambda *a, **k: '')
+    monkeypatch.setattr(AuthoringSandbox, '_renew', lambda self: None)
+    session = AuthoringSandbox(config, tmp_path/'run', 'paper', threading.Event())
+    session.start()
+    assert session.state['task_timeout_sec'] == 25200
+    assert session.state['expires_at'] == session.client.expires.isoformat()
+
+
+@pytest.mark.parametrize('actual', [None, '2020-01-01T00:00:00Z', 'invalid'])
+def test_renew_success_response_cannot_hide_unextended_expiry(monkeypatch, actual):
+    from datetime import datetime, timedelta, timezone
+    from task_builder.sandbox_runtime import SandboxClient
+    client = SandboxClient({'BASE_URL':'http://platform','TASK_BUILDER_SANDBOX_RESOURCE':'pool',
+                            'AD_USERNAME':'user','AD_PASSWORD':'pass'})
+    requested = datetime.now(timezone.utc)+timedelta(hours=4)
+    monkeypatch.setattr(client, 'json', lambda *a, **k: {'expiresAt':requested.isoformat()})
+    monkeypatch.setattr(client, 'detail', lambda *a, **k: {'expiresAt':actual})
+    with pytest.raises(SandboxError, match='实际到期时间'):
+        client.renew('parent', requested)
+
+
+def test_renew_does_not_shorten_seven_hour_allocation(config, tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    target = datetime.now(timezone.utc)+timedelta(hours=48)
+    class Client:
+        base_url, resource = 'http://platform','pool'
+        def renew(self, sid, expires, **kwargs):
+            pytest.fail('充分的已确认时长不应再次发送续期请求')
+    monkeypatch.setattr('task_builder.sandbox_session.SandboxClient', Client)
+    session = AuthoringSandbox(config, tmp_path/'run', 'paper', threading.Event())
+    session.id = 'parent'
+    session.state['expires_at'] = target.isoformat()
+    session.renew_once()
+    assert session.state['expires_at'] == target.isoformat()
+    assert session.state['renewal_skipped'] == 'existing_lifetime_sufficient'
+    assert session.state['lifetime_checked_at']
+    assert 'last_renewed_at' not in session.state
+
+
+def test_missing_sandbox_is_not_reported_retained(config, tmp_path, monkeypatch):
+    class Client:
+        base_url, resource = 'http://platform','pool'
+        def detail(self, sid):
+            raise SandboxError('not found', 404)
+        def children(self, sid):
+            return []
+    monkeypatch.setattr('task_builder.sandbox_session.SandboxClient', Client)
+    session = AuthoringSandbox(config, tmp_path/'run', 'paper', threading.Event())
+    session.id = 'gone'
+    session.close(retain=True)
+    assert session.state['phase'] == 'missing'
+    assert session.state['retained'] is False
+
+
+def test_final_transfer_error_preserves_original_cause(config, tmp_path, monkeypatch):
+    monkeypatch.setattr(dispatch, 'AuthoringSandbox', FakeSession)
+    monkeypatch.setattr(dispatch, '_prepare', lambda *a: None)
+    monkeypatch.setattr(dispatch, '_launch', lambda *a: (_ for _ in ()).throw(SandboxError('original failure')))
+    monkeypatch.setattr(dispatch, '_stop', lambda *a: (_ for _ in ()).throw(SandboxError('sandbox disappeared', 404)))
+    with pytest.raises(SandboxError, match='sandbox disappeared.*original failure'):
+        dispatch._dispatch_one(bundle(config), config, tmp_path/'run', threading.Event())
+    state = FakeSession.instances[-1].state
+    assert state['dispatch_error']['message'] == 'original failure'
+    assert state['transfer_error']['stage'] == 'stop-worker'
+
+
+@pytest.mark.parametrize('disappears_after_check', [False, True])
+def test_cleanup_accepts_confirmed_absence_even_when_delete_returns_500(monkeypatch, disappears_after_check):
+    from task_builder.sandbox_runtime import SandboxClient
+    client = SandboxClient({'BASE_URL':'http://platform','TASK_BUILDER_SANDBOX_RESOURCE':'pool',
+                            'AD_USERNAME':'user','AD_PASSWORD':'pass'})
+    calls = []
+    def detail(*a, **k):
+        calls.append('detail')
+        if disappears_after_check and len(calls)==1:
+            return {'state':'Running'}
+        raise SandboxError('not found',404)
+    def delete(*a, **k):
+        assert disappears_after_check
+        assert k['retry'] is False
+        calls.append('delete')
+        raise SandboxError('Failed to delete sandbox',500)
+    monkeypatch.setattr(client,'detail',detail)
+    monkeypatch.setattr(client,'json',delete)
+    client.delete('gone')
+    assert calls == (['detail','delete','detail'] if disappears_after_check else ['detail'])
+
+
+def test_recovery_only_touches_requested_sources(config, tmp_path, monkeypatch):
+    previous=tmp_path/'previous'
+    config.resume_from=previous
+    config.run_txt=tmp_path/'run.txt'
+    config.run_txt.write_text('paper\n')
+    states=previous/'sandbox-workers'
+    states.mkdir(parents=True)
+    for slug in ['paper','unrelated']:
+        (states/(slug+'.json')).write_text(json.dumps({'source':slug,'name':'tb-'+slug,
+            'sandbox_id':slug,'phase':'working','base_url':'http://platform','resource':'pool'}))
+    touched=[]
+    class Client:
+        base_url,resource='http://platform','pool'
+        def detail(self,sid):
+            touched.append(sid)
+            raise SandboxError('gone',404)
+        def children(self,sid): return []
+        def delete(self,sid): pass
+    monkeypatch.setattr(dispatch,'SandboxClient',Client)
+    dispatch.recover_retained(config)
+    assert touched == ['paper']
+    assert json.loads((states/'unrelated.json').read_text())['phase']=='working'
+
+
+def test_resume_keeps_checkpoint_draft_evidence(config, tmp_path):
+    from task_builder.resume import restore_source
+    from task_builder.workspace import create_source_workspace
+    config.resume_from=tmp_path/'previous'
+    old=config.resume_from/'workspace/sources/paper'
+    for name in ['plan/plan.json','previous-evidence/checkpoint-draft/solution/solve.sh','reviews/review.json']:
+        p=old/name
+        p.parent.mkdir(parents=True,exist_ok=True)
+        p.write_text('saved evidence')
+    workspace=create_source_workspace(tmp_path/'new',tmp_path/'shared',bundle(config))
+    plan,draft=restore_source(bundle(config),workspace,config)
+    assert plan and not draft
+    assert (workspace.source_root/'previous-evidence/previous-evidence/checkpoint-draft/solution/solve.sh').read_text()=='saved evidence'
+
+
+def test_rebuilding_writer_can_read_prior_draft_and_review(config, tmp_path, monkeypatch):
+    from task_builder import writer_agent
+    from task_builder.workspace import create_source_workspace
+    workspace=create_source_workspace(tmp_path/'new',tmp_path/'shared',bundle(config))
+    evidence=workspace.source_root/'previous-evidence'
+    evidence.mkdir()
+    (evidence/'review.txt').write_text('fix the selected channels check')
+    monkeypatch.setattr(writer_agent,'read_shared_material',lambda p: ('rubric','chemistry','environment'))
+    seen={}
+    def run(agent,draft,log_path,**options):
+        seen.update(options)
+        for name in writer_agent._REQUIRED_FILES:
+            p=draft/name
+            p.parent.mkdir(parents=True,exist_ok=True)
+            p.write_text('rebuilt')
+    monkeypatch.setattr(writer_agent,'_run_until_files_written',run)
+    writer_agent.run_writer_agent(bundle(config),config,workspace,object())
+    assert str(evidence) in seen['prompt']
+    assert evidence in seen['allowed_dirs']
+    assert evidence in seen['read_only_dirs']
+    assert '缺少 data/' in seen['prompt']
+
+
+@pytest.mark.parametrize('temporary_name', ['tmp', '.tmp'])
+@pytest.mark.parametrize('checkpoint', [False, True])
+def test_codex_native_temporary_links_are_not_results(tmp_path, temporary_name, checkpoint):
+    run = tmp_path / 'run'
+    source = run / 'workspace/sources/paper'
+    external = tmp_path / 'codex-binary'
+    external.write_bytes(b'binary')
+    homes = [source / 'logs/codex/session', source / 'previous-evidence/previous-evidence/logs/codex/old-session']
+    for home in homes:
+        temporary = home / temporary_name / 'arg0/launcher'
+        temporary.mkdir(parents=True)
+        (temporary / 'apply_patch').symlink_to(external)
+        (temporary / 'dangling-helper').symlink_to(tmp_path / 'missing-binary')
+        sessions = home / 'sessions'
+        sessions.mkdir()
+        (sessions / 'session.jsonl').write_text('{"type":"token_usage_record"}\n')
+    (source / 'logs/usage-events.jsonl').write_text('{"kind":"start"}\n')
+    draft_tmp = source / 'draft/tmp'
+    draft_tmp.mkdir(parents=True)
+    (draft_tmp / 'required.txt').write_text('task artifact')
+    destination = tmp_path / 'packed'
+    pack_artifacts(run, 'paper', destination, checkpoint=checkpoint)
+    restored = tmp_path / 'restored'
+    download_archive(LocalFiles(), 'id', str(destination), restored, allowed=lambda _: True)
+    for home in homes:
+        relative = home.relative_to(run)
+        assert not (restored / relative / temporary_name).exists()
+        assert (restored / relative / 'sessions/session.jsonl').is_file()
+        assert (home / temporary_name / 'arg0/launcher/apply_patch').is_symlink()
+    assert (restored / 'workspace/sources/paper/logs/usage-events.jsonl').is_file()
+    assert (restored / 'workspace/sources/paper/draft/tmp/required.txt').is_file()
+
+
+def test_external_links_in_task_outputs_still_fail_with_path(tmp_path):
+    run = tmp_path / 'run'
+    draft = run / 'workspace/sources/paper/draft/tmp'
+    draft.mkdir(parents=True)
+    outside = tmp_path / 'private'
+    outside.write_text('private')
+    (draft / 'answer').symlink_to(outside)
+    with pytest.raises(SandboxError, match='draft/tmp/answer'):
+        pack_artifacts(run, 'paper', tmp_path / 'packed')
+    assert outside.read_text() == 'private'
+
+
+def test_export_failure_keeps_redacted_diagnostic_before_temp_cleanup(config, tmp_path):
+    commands = []
+    class Client:
+        _password = 'platform-private'
+        _username = 'account-private'
+        _token = 'session-private'
+        def download(self, sandbox, path):
+            return b'Traceback: test-token platform-private account-private session-private\nSandboxError: blocked artifact\n'
+    class Session:
+        id = 'sandbox'
+        client = Client()
+        def command(self, command):
+            commands.append(command)
+            return '1\n' if 'then cat' in command else ''
+    with pytest.raises(SandboxError, match='blocked artifact'):
+        dispatch._export(Session(), tmp_path / 'run', 'paper', config=config)
+    log = (tmp_path / 'run/sandbox-workers/paper/export-error.log').read_text()
+    assert '<redacted>' in log
+    for secret in ['test-token', 'platform-private', 'account-private', 'session-private']:
+        assert secret not in log
+    assert commands[-1].startswith('rm -rf /tmp/tb-export-')
+
+
+@pytest.mark.parametrize('remaining_hours,should_stop', [(23,False),(0.5,True)])
+def test_failed_renewal_preserves_existing_allocation(config, tmp_path, monkeypatch, remaining_hours, should_stop):
+    from datetime import datetime,timedelta,timezone
+    class Client:
+        base_url,resource='http://platform','pool'
+        def renew(self,*args,**kwargs): raise SandboxError('renew endpoint HTTP 500',500)
+    monkeypatch.setattr('task_builder.sandbox_session.SandboxClient',Client)
+    session=AuthoringSandbox(config,tmp_path/'run','paper',threading.Event())
+    session.id='parent'
+    expiry=(datetime.now(timezone.utc)+timedelta(hours=remaining_hours)).isoformat()
+    session.state['expires_at']=expiry
+    class StopAfterAttempt:
+        calls=0
+        def wait(self,seconds):
+            self.calls+=1
+            return self.calls>1
+    session.stop_renewing=StopAfterAttempt()
+    session._renew()
+    assert bool(session.renew_error)==should_stop
+    assert session.state['expires_at']==expiry
+    if not should_stop:
+        session.check()
+        assert session.state['renew_warning']=='renew endpoint HTTP 500'

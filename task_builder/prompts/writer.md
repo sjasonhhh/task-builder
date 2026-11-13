@@ -28,9 +28,10 @@
 - 参考提交：按 reference_submission，从 {code} 中的参考结果或代码迁移到 solution/。
 
 生成内容后逐条自查 rubric。
+计划采用公开替代数据时，按 rubric 获取、准备并记录来源。
 
 instruction.md 必须直接从科学背景开始，不得在开头添加题目名称、任务名称或以题目名称为内容的标题；可使用“科学背景”作为首节标题。
 
-task.toml 格式：顶层 `artifacts = [...]` 列表（不能写成 `[artifacts]` 表）；必须有 `[task]` 表，`name` 为 `org/name` 格式（例如 `biology/spatial-cell-abundance`），不得使用真实组织或项目名称；不要写 `environment_mode`、`docker_image` 或镜像占位符。
+task.toml 格式遵循 rubric 的 task_toml_schema；实验和评测环境分别沿用共享环境的 Dockerfile.experiment、Dockerfile.evaluation 及其依赖。评测 Dockerfile 需要补充实际文件复制和容器评测入口；不要重写共享依赖。
 
-论文正文读 `{context}/text.md`；HDF5 等数据是二进制文件，不能用 Read 工具读取。请以 Planner 计划、论文正文、文件清单、代码 README 和少量关键源码为依据。先读取计划，然后立即用 Write 工具创建并保存 `task.toml`、`instruction.md`、`README.md`、`tests/test.sh`、`solution/solve.sh` 五个必需文件，再准备草稿 data/，最后用 Edit 按需要完善；不要在首次写入前反复探索源码。文件内容必须通过 Write 工具写入磁盘，只在思考或回复里写出内容不算完成。完成后保存文件并简短说明，不要输出长篇方案。
+论文正文读 `{context}/text.md`；HDF5 等数据是二进制文件，不能用 Read 工具读取。请以 Planner 计划、论文正文、文件清单、代码 README 和少量关键源码为依据。先保存任务配置、题面、说明和参考提交，再按计划完成评测实现与数据准备。评测源文件的名称、格式和目录组织遵循 rubric 的 task_package。文件内容必须通过 Write 工具写入磁盘，只在思考或回复里写出内容不算完成。完成后保存文件并简短说明，不要输出长篇方案。
